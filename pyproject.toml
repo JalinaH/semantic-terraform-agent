@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "semantic-terraform-agent"
+version = "0.1.0"
+description = "A local, schema-aware agent for diagnosing Terraform failures"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Semantic Terraform Agent contributors" }]
+dependencies = [
+  "google-genai>=1.0.0,<2",
+  "pydantic>=2.8,<3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-cov>=5.0"]
+
+[project.scripts]
+semantic-terraform-agent = "semantic_terraform_agent.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/semantic_terraform_agent"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+pythonpath = ["src"]
+testpaths = ["tests"]
+
