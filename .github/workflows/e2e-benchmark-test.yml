@@ -40,6 +40,7 @@ jobs:
         with:
           repository: ${{ env.BENCHMARK_REPOSITORY }}
           ref: ${{ env.BENCHMARK_REF }}
+          token: ${{ secrets.BENCHMARK_REPO_TOKEN }}
           path: ${{ env.BENCHMARK_PATH }}
           fetch-depth: 2
           persist-credentials: false
