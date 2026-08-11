@@ -35,6 +35,45 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Check required E2E settings
+        shell: bash
+        env:
+          AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+          BENCHMARK_REPO_TOKEN: ${{ secrets.BENCHMARK_REPO_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${AWS_ROLE_ARN}" || -z "${AWS_REGION}" ]]; then
+            echo "::error::Set repository variables AWS_ROLE_ARN and AWS_REGION."
+            exit 1
+          fi
+          if [[ -z "${GEMINI_API_KEY}" ]]; then
+            echo "::error::Set the GEMINI_API_KEY repository secret."
+            exit 1
+          fi
+          if [[ -z "${BENCHMARK_REPO_TOKEN}" ]]; then
+            echo "::error::Set BENCHMARK_REPO_TOKEN as a repository secret in semantic-terraform-agent."
+            exit 1
+          fi
+
+      - name: Verify benchmark token access
+        shell: bash
+        env:
+          BENCHMARK_REPO_TOKEN: ${{ secrets.BENCHMARK_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          status="$(
+            curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+              --header "Accept: application/vnd.github+json" \
+              --header "Authorization: Bearer ${BENCHMARK_REPO_TOKEN}" \
+              --header "X-GitHub-Api-Version: 2026-03-10" \
+              "https://api.github.com/repos/${BENCHMARK_REPOSITORY}"
+          )"
+          if [[ "${status}" != "200" ]]; then
+            echo "::error::BENCHMARK_REPO_TOKEN cannot read ${BENCHMARK_REPOSITORY} (GitHub API HTTP ${status}). Update the secret in semantic-terraform-agent with the current fine-grained token value."
+            exit 1
+          fi
+
       - name: Check out Terraform failure benchmarks
         uses: actions/checkout@v6
         with:
@@ -63,27 +102,6 @@ jobs:
           set -euo pipefail
           python -m pip install --disable-pip-version-check .
           semantic-terraform-agent --help >/dev/null
-
-      - name: Check required E2E settings
-        shell: bash
-        env:
-          AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
-          BENCHMARK_REPO_TOKEN: ${{ secrets.BENCHMARK_REPO_TOKEN }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: |
-          set -euo pipefail
-          if [[ -z "${AWS_ROLE_ARN}" || -z "${AWS_REGION}" ]]; then
-            echo "::error::Set repository variables AWS_ROLE_ARN and AWS_REGION."
-            exit 1
-          fi
-          if [[ -z "${GEMINI_API_KEY}" ]]; then
-            echo "::error::Set the GEMINI_API_KEY repository secret."
-            exit 1
-          fi
-          if [[ -z "${BENCHMARK_REPO_TOKEN}" ]]; then
-            echo "::error::Set the BENCHMARK_REPO_TOKEN repository secret."
-            exit 1
-          fi
 
       - name: Authenticate to AWS with GitHub OIDC
         uses: aws-actions/configure-aws-credentials@v6
