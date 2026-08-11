@@ -335,6 +335,8 @@ repository:
 - Action variable `AWS_ROLE_ARN`
 - Action variable `AWS_REGION`
 - Action secret `GEMINI_API_KEY`
+- Action secret `BENCHMARK_REPO_TOKEN`, containing a fine-grained PAT with read-only
+  `Contents` access to `JalinaH/terraform-failure-benchmarks`
 
 The IAM role trust policy must permit the agent repository subject, for example
 `repo:JalinaH/semantic-terraform-agent:*`. Use a plan-only least-privilege policy. The
