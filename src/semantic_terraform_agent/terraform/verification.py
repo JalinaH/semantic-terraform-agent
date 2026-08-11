@@ -123,11 +123,16 @@ def validate_patch_scope(patch: str, layout: RepositoryLayout) -> list[str]:
     return list(dict.fromkeys(changed))
 
 
-def _bounded_output(value: str | bytes | None) -> str:
+def _bounded_output(
+    value: str | bytes | None, *, sensitive_values: tuple[str, ...] = ()
+) -> str:
     if value is None:
         return ""
     text = value.decode(errors="replace") if isinstance(value, bytes) else str(value)
     text = redact_secrets(text)
+    for secret in sensitive_values:
+        if len(secret) >= 4:
+            text = text.replace(secret, "[REDACTED]")
     limit = DEFAULT_LIMITS.max_verification_output_chars
     if len(text) <= limit:
         return text
@@ -142,6 +147,19 @@ def _run_command(
     env: dict[str, str],
 ) -> VerificationCommand:
     started = time.perf_counter()
+    sensitive_values = tuple(
+        value
+        for name, value in env.items()
+        if name.startswith("TF_VAR_")
+        or name
+        in {
+            item.strip()
+            for item in env.get(
+                "SEMANTIC_TERRAFORM_AGENT_PASSTHROUGH_ENV", ""
+            ).split(",")
+            if item.strip()
+        }
+    )
     try:
         completed = subprocess.run(
             actual_command,
@@ -156,8 +174,9 @@ def _run_command(
         return VerificationCommand(
             command=recorded_command,
             status="error",
-            stdout=_bounded_output(exc.stdout),
-            stderr=_bounded_output(exc.stderr) or "Command timed out.",
+            stdout=_bounded_output(exc.stdout, sensitive_values=sensitive_values),
+            stderr=_bounded_output(exc.stderr, sensitive_values=sensitive_values)
+            or "Command timed out.",
             duration_seconds=round(time.perf_counter() - started, 6),
         )
     except OSError as exc:
@@ -171,8 +190,8 @@ def _run_command(
         command=recorded_command,
         status="passed" if completed.returncode == 0 else "failed",
         exit_code=completed.returncode,
-        stdout=_bounded_output(completed.stdout),
-        stderr=_bounded_output(completed.stderr),
+        stdout=_bounded_output(completed.stdout, sensitive_values=sensitive_values),
+        stderr=_bounded_output(completed.stderr, sensitive_values=sensitive_values),
         duration_seconds=round(time.perf_counter() - started, 6),
     )
 

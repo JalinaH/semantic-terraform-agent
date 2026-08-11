@@ -1,0 +1,137 @@
+name: E2E benchmark diagnosis
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: e2e-benchmark-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.13"
+  TERRAFORM_VERSION: "1.15.7"
+  BENCHMARK_REPOSITORY: JalinaH/terraform-failure-benchmarks
+  BENCHMARK_REF: main
+  BENCHMARK_PATH: terraform-failure-benchmarks
+  BENCHMARK_CASE: cases/dynamodb-key-schema-failure
+  BENCHMARK_LOG: collected-runs/terraform-logs-dynamodb-key-schema-failure/plan.stderr.log
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  TF_VAR_aws_region: ${{ vars.AWS_REGION }}
+  TF_VAR_name_prefix: stfa-agent-${{ github.repository_id }}-${{ github.run_id }}
+
+jobs:
+  e2e:
+    name: Diagnose and verify benchmark failure
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out Semantic Terraform Failure Agent
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Check out Terraform failure benchmarks
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.BENCHMARK_REPOSITORY }}
+          ref: ${{ env.BENCHMARK_REF }}
+          path: ${{ env.BENCHMARK_PATH }}
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install pinned Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Install Semantic Terraform Failure Agent
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check .
+          semantic-terraform-agent --help >/dev/null
+
+      - name: Check required E2E settings
+        shell: bash
+        env:
+          AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${AWS_ROLE_ARN}" || -z "${AWS_REGION}" ]]; then
+            echo "::error::Set repository variables AWS_ROLE_ARN and AWS_REGION."
+            exit 1
+          fi
+          if [[ -z "${GEMINI_API_KEY}" ]]; then
+            echo "::error::Set the GEMINI_API_KEY repository secret."
+            exit 1
+          fi
+
+      - name: Authenticate to AWS with GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: semantic-tf-agent-${{ github.run_id }}
+
+      - name: Run agent against known Terraform failure
+        shell: bash
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          RESULT_PATH: ${{ runner.temp }}/semantic-terraform-agent/result.json
+          SEMANTIC_TERRAFORM_AGENT_PASSTHROUGH_ENV: >-
+            AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY,AWS_SESSION_TOKEN,AWS_REGION,AWS_DEFAULT_REGION
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname "${RESULT_PATH}")"
+          semantic-terraform-agent diagnose \
+            --repo-path "${GITHUB_WORKSPACE}/${BENCHMARK_PATH}" \
+            --terraform-dir "${BENCHMARK_CASE}" \
+            --log-file "${GITHUB_WORKSPACE}/${BENCHMARK_PATH}/${BENCHMARK_LOG}" \
+            --provider gemini \
+            --model gemini-3.6-flash \
+            --context-mode auto \
+            --verify-patch \
+            --max-repair-attempts 1 \
+            --output "${RESULT_PATH}"
+
+      - name: Require successful isolated verification
+        shell: bash
+        env:
+          RESULT_PATH: ${{ runner.temp }}/semantic-terraform-agent/result.json
+        run: |
+          set -euo pipefail
+          python - "${RESULT_PATH}" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          result_path = pathlib.Path(sys.argv[1])
+          result = json.loads(result_path.read_text(encoding="utf-8"))
+          status = result.get("diagnosis", {}).get("verification_status")
+          print(f"Final verification status: {status}")
+          if status not in {"verified_first_attempt", "verified_after_retry"}:
+              raise SystemExit(f"E2E verification did not pass: {status}")
+          PY
+
+      - name: Upload E2E diagnosis result
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: semantic-terraform-agent-e2e-${{ github.run_number }}
+          path: ${{ runner.temp }}/semantic-terraform-agent/result.json
+          if-no-files-found: error
+          retention-days: 30
+

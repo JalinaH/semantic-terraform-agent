@@ -319,6 +319,29 @@ diff, use one whose paths are relative to the selected repository checkout; pack
 diffs whose paths start with `terraform/` describe the package layout rather than the live
 `cases/...` checkout and should not be hardcoded into the product.
 
+## GitHub Actions E2E benchmark
+
+The agent repository owns
+[`.github/workflows/e2e-benchmark-test.yml`](.github/workflows/e2e-benchmark-test.yml).
+It is manual-only (`workflow_dispatch`) and checks out
+`JalinaH/terraform-failure-benchmarks` into a subfolder without persisted Git credentials.
+It installs Python, Terraform `1.15.7`, and this package; authenticates to AWS through OIDC;
+runs the DynamoDB benchmark diagnosis with one permitted repair; requires a verified final
+status; and uploads `result.json` even when the verification gate fails.
+
+Configure the following in the **semantic-terraform-agent** repository—not the benchmark
+repository:
+
+- Action variable `AWS_ROLE_ARN`
+- Action variable `AWS_REGION`
+- Action secret `GEMINI_API_KEY`
+
+The IAM role trust policy must permit the agent repository subject, for example
+`repo:JalinaH/semantic-terraform-agent:*`. Use a plan-only least-privilege policy. The
+workflow passes only explicit ephemeral AWS environment variables plus `TF_VAR_*` into the
+isolated Terraform subprocesses; other caller environment values remain excluded, and
+passed values are redacted if command output repeats them.
+
 ## Recommended next phase
 
 Add provider-neutral verification evaluation and environment-failure classification: measure

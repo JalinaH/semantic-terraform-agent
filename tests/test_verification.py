@@ -231,6 +231,32 @@ def test_command_output_is_bounded_and_redacted(monkeypatch, tmp_path: Path) -> 
     assert "truncated" in command.stdout
 
 
+def test_explicit_oidc_environment_values_are_redacted_from_output(
+    monkeypatch, tmp_path: Path
+) -> None:
+    temporary_credential = "temporary-oidc-secret-value"
+    monkeypatch.setattr(
+        verification_module.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=1,
+            stdout=f"provider repeated {temporary_credential}",
+            stderr="",
+        ),
+    )
+    command = verification_module._run_command(
+        ["terraform", "plan"],
+        ["terraform", "plan"],
+        cwd=tmp_path,
+        env={
+            "AWS_SESSION_TOKEN": temporary_credential,
+            "SEMANTIC_TERRAFORM_AGENT_PASSTHROUGH_ENV": "AWS_SESSION_TOKEN",
+        },
+    )
+    assert temporary_credential not in command.stdout
+    assert "[REDACTED]" in command.stdout
+
+
 def test_real_git_application_does_not_modify_original_repository(
     monkeypatch, terraform_repo: Path
 ) -> None:
