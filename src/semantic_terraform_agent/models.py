@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Literal, TypeAlias
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -77,14 +77,77 @@ class ModelDiagnosis(StrictModel):
     evidence: list[EvidenceItem]
 
 
-class Diagnosis(StrictModel):
+class VerificationCommand(StrictModel):
+    command: list[str]
+    status: Literal["passed", "failed", "skipped", "error"]
+    exit_code: int | None = None
+    stdout: str = ""
+    stderr: str = ""
+    duration_seconds: float = 0.0
+
+
+VerificationStage: TypeAlias = Literal[
+    "patch_check", "patch_apply", "fmt", "init", "validate", "plan"
+]
+AttemptStatus: TypeAlias = Literal[
+    "verified", "failed", "rejected", "unavailable", "skipped"
+]
+FinalVerificationStatus: TypeAlias = Literal[
+    "verified_first_attempt",
+    "verified_after_retry",
+    "verification_failed",
+    "patch_rejected",
+    "verification_unavailable",
+    "verification_skipped",
+]
+
+
+class VerificationCommands(StrictModel):
+    patch_check: VerificationCommand | None = None
+    patch_apply: VerificationCommand | None = None
+    fmt: VerificationCommand | None = None
+    init: VerificationCommand | None = None
+    terraform_validate: VerificationCommand | None = Field(default=None, alias="validate")
+    plan: VerificationCommand | None = None
+
+
+class VerificationAttempt(StrictModel):
+    attempt: int = Field(ge=1, le=2)
+    patch: str
+    status: AttemptStatus
+    failed_stage: VerificationStage | None = None
+    isolation: Literal["temporary-copy"] = "temporary-copy"
+    changed_files: list[str] = Field(default_factory=list)
+    commands: VerificationCommands = Field(default_factory=VerificationCommands)
+    temporary_copy_cleaned: bool
+    warnings: list[str] = Field(default_factory=list)
+
+
+class DiagnosisCandidate(StrictModel):
     root_cause: str
     affected_resources: list[str]
     violated_constraint: str
     suggested_patch: str
     model_confidence: float
-    evidence_score: float
     evidence: list[EvidenceItem]
+
+
+class VerificationSignal(StrictModel):
+    passed: bool
+    status: FinalVerificationStatus
+    failed_stage: VerificationStage | None = None
+    reason: str | None = None
+
+
+class Diagnosis(StrictModel):
+    initial: DiagnosisCandidate
+    repair: DiagnosisCandidate | None = None
+    attempts: list[VerificationAttempt]
+    final_patch: str
+    verification_status: FinalVerificationStatus
+    model_confidence: float
+    evidence_score: float
+    verification: VerificationSignal
 
 
 class TokenUsage(StrictModel):
@@ -101,6 +164,12 @@ class DiagnosisRequest(StrictModel):
     context: ContextSelection
     schemas: list[SchemaRecord]
     terraform_version: str | None = None
+
+
+class RepairRequest(StrictModel):
+    original: DiagnosisRequest
+    previous_diagnosis: ModelDiagnosis
+    failed_attempt: VerificationAttempt
 
 
 class ProviderResponse(StrictModel):

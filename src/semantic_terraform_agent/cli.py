@@ -31,6 +31,19 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("lightweight", "schema-aware", "auto"),
         default="auto",
     )
+    diagnose.add_argument(
+        "--verify-patch",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="verify the candidate in a temporary copy (default: enabled)",
+    )
+    diagnose.add_argument(
+        "--max-repair-attempts",
+        type=int,
+        choices=(0, 1),
+        default=1,
+        help="maximum repair attempts after actionable verification failure (default: 1)",
+    )
     diagnose.add_argument("--output", required=True, type=Path)
     return parser
 
@@ -45,18 +58,62 @@ def _write_result(path: Path, result: ResultDocument) -> None:
     )
 
 
+def _stage_label(stage: str) -> str:
+    return {
+        "patch_check": "git apply --check",
+        "patch_apply": "git apply",
+        "fmt": "terraform fmt",
+        "init": "terraform init",
+        "validate": "terraform validate",
+        "plan": "terraform plan",
+    }[stage]
+
+
 def _print_summary(result: ResultDocument, output: Path) -> None:
     assert result.diagnosis and result.context and result.failure
-    affected = ", ".join(result.diagnosis.affected_resources) or "not identified"
-    print(f"Diagnosis: {result.diagnosis.root_cause}")
-    print(f"Affected resources: {affected}")
+    diagnosis = result.diagnosis
+    final_candidate = diagnosis.repair or diagnosis.initial
+    affected = ", ".join(final_candidate.affected_resources) or "not identified"
+    print("Root cause:")
+    print(f"  {final_candidate.root_cause}")
+    print("Affected resources:")
+    print(f"  {affected}")
     print(
         f"Context: {result.context.selected_mode} ({result.context.selection_reason})"
     )
     print(
-        f"Scores: model={result.diagnosis.model_confidence:.2f}, "
-        f"evidence={result.diagnosis.evidence_score:.2f}"
+        f"Scores: model={diagnosis.model_confidence:.2f}, "
+        f"evidence={diagnosis.evidence_score:.2f}"
     )
+    first = diagnosis.attempts[0]
+    first_description = first.status
+    if first.failed_stage:
+        first_description = f"verification failed at {_stage_label(first.failed_stage)}"
+    print("Initial patch:")
+    print(f"  {first_description}")
+    print("Repair attempt:")
+    print("  generated" if diagnosis.repair else "  not generated")
+    print("Final verification:")
+    print(f"  {diagnosis.verification.status.replace('_', ' ').upper()}")
+    if diagnosis.verification.reason:
+        print("Reason:")
+        print(f"  {diagnosis.verification.reason}")
+    final_attempt = diagnosis.attempts[-1]
+    for name, label in (
+        ("fmt", "terraform fmt"),
+        ("init", "terraform init"),
+        ("terraform_validate", "terraform validate"),
+        ("plan", "terraform plan"),
+    ):
+        command = getattr(final_attempt.commands, name)
+        if command is not None:
+            display = {
+                "passed": "PASS",
+                "failed": "FAIL",
+                "skipped": "SKIP",
+                "error": "ERROR",
+            }[command.status]
+            print(f"{label:<18} {display}")
     print(f"Result: {output.expanduser().resolve(strict=False)}")
     if result.warnings:
         print(f"Warnings: {len(result.warnings)}")
@@ -76,6 +133,8 @@ def main(argv: list[str] | None = None) -> int:
             provider_name=args.provider,
             model=args.model,
             context_mode=args.context_mode,
+            verification_enabled=args.verify_patch,
+            max_repair_attempts=args.max_repair_attempts,
         )
         _write_result(args.output, result)
     except (AgentError, OSError, ValidationError, ValueError) as exc:

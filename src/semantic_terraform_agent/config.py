@@ -24,6 +24,8 @@ class Limits:
     max_diff_bytes: int = 2 * 1024 * 1024
     max_source_bytes: int = 512 * 1024
     max_prompt_log_chars: int = 20_000
+    max_patch_bytes: int = 1024 * 1024
+    max_verification_output_chars: int = 8_000
     max_command_output_bytes: int = 50 * 1024 * 1024
     command_timeout_seconds: int = 180
 
@@ -39,4 +41,3 @@ def resolve_existing_file(path: Path, *, label: str, max_bytes: int) -> Path:
     if size > max_bytes:
         raise InputError(f"{label} exceeds the {max_bytes}-byte input limit: {path}")
     return resolved
-

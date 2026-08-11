@@ -10,6 +10,11 @@ from semantic_terraform_agent.models import (
     ContextSelection,
     DiagnosisRequest,
     FailureInfo,
+    ModelDiagnosis,
+    RepairRequest,
+    VerificationAttempt,
+    VerificationCommand,
+    VerificationCommands,
 )
 from semantic_terraform_agent.reasoning.gemini import GeminiProvider
 
@@ -59,6 +64,29 @@ def valid_payload() -> dict:
     }
 
 
+def repair_request() -> RepairRequest:
+    previous = ModelDiagnosis.model_validate(valid_payload())
+    return RepairRequest(
+        original=request(),
+        previous_diagnosis=previous,
+        failed_attempt=VerificationAttempt(
+            attempt=1,
+            patch=previous.suggested_patch,
+            status="failed",
+            failed_stage="plan",
+            commands=VerificationCommands(
+                plan=VerificationCommand(
+                    command=["terraform", "plan"],
+                    status="failed",
+                    exit_code=1,
+                    stderr="plan rejected patch",
+                )
+            ),
+            temporary_copy_cleaned=True,
+        ),
+    )
+
+
 def test_structured_gemini_response_is_validated() -> None:
     models = FakeModels(json.dumps(valid_payload()))
     provider = GeminiProvider(
@@ -81,6 +109,20 @@ def test_extra_gemini_fields_are_rejected() -> None:
     )
     with pytest.raises(ProviderError, match="invalid structured JSON"):
         provider.diagnose(request())
+
+
+def test_gemini_repair_uses_dedicated_prompt_and_same_strict_schema() -> None:
+    models = FakeModels(json.dumps(valid_payload()))
+    provider = GeminiProvider(
+        "gemini-test",
+        api_key="x",
+        client_factory=lambda **_: SimpleNamespace(models=models),
+    )
+    response = provider.repair(repair_request())
+    assert response.diagnosis.root_cause == "mode is invalid"
+    assert "previous candidate patch did not pass Terraform verification" in models.last_kwargs[
+        "contents"
+    ]
 
 
 def test_missing_api_key_is_reported(monkeypatch) -> None:

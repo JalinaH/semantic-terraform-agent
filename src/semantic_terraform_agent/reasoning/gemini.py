@@ -13,9 +13,10 @@ from semantic_terraform_agent.models import (
     DiagnosisRequest,
     ModelDiagnosis,
     ProviderResponse,
+    RepairRequest,
     TokenUsage,
 )
-from semantic_terraform_agent.reasoning.prompts import build_prompt
+from semantic_terraform_agent.reasoning.prompts import build_prompt, build_repair_prompt
 
 
 class GeminiProvider:
@@ -45,8 +46,13 @@ class GeminiProvider:
         return genai.Client(api_key=api_key)
 
     def diagnose(self, request: DiagnosisRequest) -> ProviderResponse:
+        return self._generate(build_prompt(request))
+
+    def repair(self, request: RepairRequest) -> ProviderResponse:
+        return self._generate(build_repair_prompt(request))
+
+    def _generate(self, prompt: str) -> ProviderResponse:
         client = self._client()
-        prompt = build_prompt(request)
         schema = ModelDiagnosis.model_json_schema()
         try:
             response = client.models.generate_content(

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import shutil
 import subprocess
@@ -13,44 +12,14 @@ from pathlib import Path
 from semantic_terraform_agent.collectors.repository import RepositoryLayout
 from semantic_terraform_agent.config import DEFAULT_LIMITS
 from semantic_terraform_agent.models import SchemaRecord, TerraformInfo
-
-
-SAFE_TERRAFORM_NAMES = {".terraform.lock.hcl"}
-SAFE_TERRAFORM_SUFFIXES = (".tf", ".tf.json")
-EXCLUDED_PARTS = {".git", ".terraform", ".hg", ".svn", "node_modules", ".venv"}
+from semantic_terraform_agent.terraform.workspace import (
+    create_safe_terraform_copy,
+    sanitized_environment,
+)
 
 
 def find_terraform() -> str | None:
     return shutil.which("terraform")
-
-
-def _safe_inspection_copy(layout: RepositoryLayout, destination: Path) -> Path:
-    for source in layout.root.rglob("*"):
-        relative = source.relative_to(layout.root)
-        if any(part in EXCLUDED_PARTS for part in relative.parts):
-            continue
-        if source.is_symlink() or not source.is_file():
-            continue
-        if source.name not in SAFE_TERRAFORM_NAMES and not source.name.endswith(SAFE_TERRAFORM_SUFFIXES):
-            continue
-        target = destination / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, target)
-    return destination / layout.terraform_dir
-
-
-def _sanitized_environment(temp_home: Path) -> dict[str, str]:
-    env = {
-        "PATH": os.environ.get("PATH", ""),
-        "HOME": str(temp_home),
-        "TF_IN_AUTOMATION": "1",
-        "CHECKPOINT_DISABLE": "1",
-        "TF_INPUT": "0",
-    }
-    for name in ("SSL_CERT_FILE", "SSL_CERT_DIR", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY"):
-        if value := os.environ.get(name):
-            env[name] = value
-    return env
 
 
 def _terraform_version(executable: str, cwd: Path, env: dict[str, str]) -> str | None:
@@ -132,7 +101,7 @@ def inspect_schemas(
             with tempfile.TemporaryDirectory(prefix="semantic-terraform-agent-version-") as temporary:
                 home = Path(temporary)
                 version = _terraform_version(
-                    executable, layout.terraform_root, _sanitized_environment(home)
+                    executable, layout.terraform_root, sanitized_environment(home)
                 )
         return (
             TerraformInfo(
@@ -158,10 +127,10 @@ def inspect_schemas(
     warnings: list[str] = []
     with tempfile.TemporaryDirectory(prefix="semantic-terraform-agent-") as temporary:
         temp_root = Path(temporary)
-        workdir = _safe_inspection_copy(layout, temp_root / "repository")
+        workdir = create_safe_terraform_copy(layout, temp_root / "repository")
         home = temp_root / "home"
         home.mkdir()
-        env = _sanitized_environment(home)
+        env = sanitized_environment(home)
         version = _terraform_version(executable, workdir, env)
         init_command = [executable, "init", "-backend=false", "-input=false", "-no-color"]
         try:
