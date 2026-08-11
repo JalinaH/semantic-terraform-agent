@@ -13,4 +13,4 @@ result.json
 *.tfstate
 *.tfstate.*
 .env
-src/DS_Store/
+src/.DS_Store/
