@@ -9,6 +9,7 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from semantic_terraform_agent.config import AgentError
+from semantic_terraform_agent.ci import CIRenderContext, render_pr_comment, render_step_summary
 from semantic_terraform_agent.models import ResultDocument
 from semantic_terraform_agent.orchestration.diagnose import diagnose_repository
 
@@ -24,6 +25,11 @@ def build_parser() -> argparse.ArgumentParser:
     diagnose.add_argument("--terraform-dir", required=True, type=Path)
     diagnose.add_argument("--log-file", required=True, type=Path)
     diagnose.add_argument("--diff-file", type=Path)
+    diagnose.add_argument(
+        "--failed-stage",
+        choices=("init", "fmt", "validate", "plan", "apply", "unknown"),
+        help="explicit Terraform stage that produced the supplied failure log",
+    )
     diagnose.add_argument("--provider", choices=("gemini",), default="gemini")
     diagnose.add_argument("--model", default="gemini-2.5-flash")
     diagnose.add_argument(
@@ -45,6 +51,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="maximum repair attempts after actionable verification failure (default: 1)",
     )
     diagnose.add_argument("--output", required=True, type=Path)
+
+    render = subparsers.add_parser(
+        "render-ci", help="render a bounded CI summary or pull-request comment"
+    )
+    render.add_argument("--result", required=True, type=Path)
+    render.add_argument("--format", required=True, choices=("summary", "comment"))
+    render.add_argument("--repository", required=True)
+    render.add_argument("--commit", required=True)
+    render.add_argument("--terraform-dir", required=True)
+    render.add_argument(
+        "--failed-stage",
+        required=True,
+        choices=("init", "fmt", "validate", "plan", "apply", "unknown"),
+    )
+    render.add_argument("--diff-comparison")
+    render.add_argument("--output", required=True, type=Path)
+    render.add_argument("--append", action="store_true")
     return parser
 
 
@@ -119,9 +142,40 @@ def _print_summary(result: ResultDocument, output: Path) -> None:
         print(f"Warnings: {len(result.warnings)}")
 
 
+def _render_ci(args: argparse.Namespace) -> int:
+    result = ResultDocument.model_validate_json(
+        args.result.expanduser().resolve(strict=True).read_text(encoding="utf-8")
+    )
+    context = CIRenderContext(
+        repository=args.repository,
+        commit=args.commit,
+        terraform_dir=args.terraform_dir,
+        failed_stage=args.failed_stage,
+        diff_comparison=args.diff_comparison,
+    )
+    rendered = (
+        render_pr_comment(result, context)
+        if args.format == "comment"
+        else render_step_summary(result, context)
+    )
+    destination = args.output.expanduser().resolve(strict=False)
+    if not destination.parent.is_dir():
+        raise OSError(f"output directory does not exist: {destination.parent}")
+    mode = "a" if args.append else "w"
+    with destination.open(mode, encoding="utf-8") as output:
+        output.write(rendered)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command == "render-ci":
+        try:
+            return _render_ci(args)
+        except (OSError, ValidationError, ValueError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 2
     if args.command != "diagnose":
         parser.error("a command is required")
     try:
@@ -135,6 +189,7 @@ def main(argv: list[str] | None = None) -> int:
             context_mode=args.context_mode,
             verification_enabled=args.verify_patch,
             max_repair_attempts=args.max_repair_attempts,
+            failed_stage=args.failed_stage,
         )
         _write_result(args.output, result)
     except (AgentError, OSError, ValidationError, ValueError) as exc:

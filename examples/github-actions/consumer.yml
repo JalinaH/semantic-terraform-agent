@@ -1,0 +1,131 @@
+name: Terraform CI with semantic failure diagnosis
+
+on:
+  pull_request:
+    paths:
+      - "infrastructure/**"
+      - ".github/workflows/terraform.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "infrastructure/**"
+      - ".github/workflows/terraform.yml"
+
+jobs:
+  terraform:
+    name: Terraform validate and plan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      failure_detected: ${{ steps.validate.outputs.failed == 'true' || steps.plan.outputs.failed == 'true' }}
+      failed_stage: ${{ steps.validate.outputs.failed_stage || steps.plan.outputs.failed_stage }}
+    env:
+      TERRAFORM_DIR: infrastructure
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      TF_VAR_aws_region: ${{ vars.AWS_REGION }}
+      FAILURE_LOG: ${{ runner.temp }}/terraform-failure.log
+
+    steps:
+      - name: Check out exact tested commit
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.15.7"
+          terraform_wrapper: false
+
+      - name: Authenticate to AWS with GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: terraform-ci-${{ github.run_id }}
+
+      - name: Terraform init
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: terraform init -backend=false -input=false -no-color
+
+      - name: Terraform validate
+        id: validate
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        shell: bash
+        run: |
+          set +e
+          terraform validate -no-color > "${FAILURE_LOG}" 2>&1
+          exit_code=$?
+          set -e
+          if (( exit_code != 0 )); then
+            echo "failed=true" >> "${GITHUB_OUTPUT}"
+            echo "failed_stage=validate" >> "${GITHUB_OUTPUT}"
+          else
+            echo "failed=false" >> "${GITHUB_OUTPUT}"
+          fi
+          exit "${exit_code}"
+
+      - name: Terraform plan
+        id: plan
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        shell: bash
+        run: |
+          set +e
+          terraform plan \
+            -input=false \
+            -lock=false \
+            -refresh=false \
+            -no-color > "${FAILURE_LOG}" 2>&1
+          exit_code=$?
+          set -e
+          if (( exit_code != 0 )); then
+            echo "failed=true" >> "${GITHUB_OUTPUT}"
+            echo "failed_stage=plan" >> "${GITHUB_OUTPUT}"
+          else
+            echo "failed=false" >> "${GITHUB_OUTPUT}"
+          fi
+          exit "${exit_code}"
+
+      - name: Upload Terraform failure log
+        if: >-
+          ${{ always() && (steps.validate.outputs.failed == 'true' ||
+          steps.plan.outputs.failed == 'true') }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: terraform-failure-log
+          path: ${{ env.FAILURE_LOG }}
+          if-no-files-found: error
+          retention-days: 7
+
+  semantic-terraform-agent:
+    name: Diagnose Terraform failure
+    needs: terraform
+    if: >-
+      ${{ always() && needs.terraform.result == 'failure' &&
+      needs.terraform.outputs.failure_detected == 'true' &&
+      (github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository) }}
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+    uses: JalinaH/semantic-terraform-agent/.github/workflows/terraform-agent.yml@main
+    with:
+      terraform_dir: infrastructure
+      terraform_version: "1.15.7"
+      failure_log_artifact: terraform-failure-log
+      failure_log_path: terraform-failure.log
+      failed_stage: ${{ needs.terraform.outputs.failed_stage }}
+      provider: gemini
+      model: gemini-3.6-flash
+      context_mode: auto
+      max_repair_attempts: 1
+      aws_region: ${{ vars.AWS_REGION }}
+    secrets:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}

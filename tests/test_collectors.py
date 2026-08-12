@@ -6,6 +6,7 @@ import pytest
 
 from semantic_terraform_agent.collectors.failure_log import parse_failure_log
 from semantic_terraform_agent.collectors.git_diff import collect_diff, parse_changed_files
+from semantic_terraform_agent.collectors import git_diff as git_diff_module
 from semantic_terraform_agent.collectors.repository import discover_repository
 from semantic_terraform_agent.config import InputError
 
@@ -35,6 +36,20 @@ def test_changed_tf_files_and_lines(terraform_repo: Path, diff_file: Path) -> No
     diff = collect_diff(layout, diff_file)
     assert diff.changed_files == ("infrastructure/main.tf",)
     assert diff.changed_lines == {"infrastructure/main.tf": (2,)}
+    assert diff.comparison == "supplied diff file"
+
+
+def test_supplied_diff_takes_precedence_over_local_fallback(
+    monkeypatch, terraform_repo: Path, diff_file: Path
+) -> None:
+    layout = discover_repository(terraform_repo, Path("infrastructure"))
+    monkeypatch.setattr(
+        git_diff_module,
+        "_run_git_diff",
+        lambda root: pytest.fail("local Git fallback must not run for a supplied diff"),
+    )
+    diff = collect_diff(layout, diff_file)
+    assert diff.source == str(diff_file.resolve())
     assert diff.comparison == "supplied diff file"
 
 

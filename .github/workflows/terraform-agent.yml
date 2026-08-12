@@ -1,0 +1,497 @@
+name: Semantic Terraform Failure Agent
+
+on:
+  workflow_call:
+    inputs:
+      terraform_dir:
+        description: Repository-relative Terraform working directory
+        required: true
+        type: string
+      failure_log_artifact:
+        description: Artifact produced by the failed Terraform CI job
+        required: true
+        type: string
+      failure_log_path:
+        description: Path to the combined Terraform failure log inside the artifact
+        required: false
+        default: terraform-plan.log
+        type: string
+      failed_stage:
+        description: Terraform stage that produced the failure log
+        required: false
+        default: plan
+        type: string
+      terraform_version:
+        description: Terraform CLI version used for isolated verification
+        required: false
+        default: "1.15.7"
+        type: string
+      provider:
+        description: LLM provider implementation
+        required: false
+        default: gemini
+        type: string
+      model:
+        description: Provider model identifier
+        required: false
+        default: gemini-3.6-flash
+        type: string
+      context_mode:
+        description: Agent context mode
+        required: false
+        default: auto
+        type: string
+      max_repair_attempts:
+        description: Maximum bounded repair attempts (0 or 1)
+        required: false
+        default: 1
+        type: number
+      aws_region:
+        description: AWS region used by Terraform verification
+        required: true
+        type: string
+    secrets:
+      GEMINI_API_KEY:
+        description: Gemini API key
+        required: true
+      AWS_ROLE_ARN:
+        description: AWS IAM role assumed through GitHub OIDC
+        required: true
+    outputs:
+      result_status:
+        description: Agent result document status
+        value: ${{ jobs.analyze.outputs.result_status }}
+      verification_status:
+        description: Final isolated verification status
+        value: ${{ jobs.analyze.outputs.verification_status }}
+      artifact_name:
+        description: Uploaded diagnosis artifact name
+        value: ${{ jobs.analyze.outputs.artifact_name }}
+
+jobs:
+  analyze:
+    name: Diagnose failed Terraform ${{ inputs.failed_stage }}
+    if: >-
+      ${{ github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      result_status: ${{ steps.classify.outputs.result_status }}
+      verification_status: ${{ steps.classify.outputs.verification_status }}
+      artifact_name: ${{ steps.classify.outputs.artifact_name }}
+    env:
+      TERRAFORM_DIR_INPUT: ${{ inputs.terraform_dir }}
+      FAILURE_LOG_PATH_INPUT: ${{ inputs.failure_log_path }}
+      FAILED_STAGE: ${{ inputs.failed_stage }}
+      PROVIDER: ${{ inputs.provider }}
+      MODEL: ${{ inputs.model }}
+      CONTEXT_MODE: ${{ inputs.context_mode }}
+      MAX_REPAIR_ATTEMPTS: ${{ inputs.max_repair_attempts }}
+      AWS_REGION: ${{ inputs.aws_region }}
+      TF_VAR_aws_region: ${{ inputs.aws_region }}
+      CHECKOUT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      RESULT_DIRECTORY: ${{ runner.temp }}/semantic-terraform-agent
+      RESULT_PATH: ${{ runner.temp }}/semantic-terraform-agent/result.json
+      FAILURE_ARTIFACT_DIRECTORY: ${{ runner.temp }}/semantic-terraform-agent/failure-artifact
+
+    steps:
+      - name: Check out exact Semantic Terraform Failure Agent revision
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install Semantic Terraform Failure Agent
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check .
+          semantic-terraform-agent --help >/dev/null
+
+      - name: Install pinned Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+          terraform_wrapper: false
+
+      - name: Check out exact caller commit
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ env.CHECKOUT_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+          clean: true
+
+      - name: Validate integration inputs and Terraform directory
+        shell: bash
+        env:
+          AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          set -euo pipefail
+
+          case "${CONTEXT_MODE}" in
+            lightweight|schema-aware|auto) ;;
+            *) echo "::error::Invalid context_mode: ${CONTEXT_MODE}"; exit 1 ;;
+          esac
+          case "${FAILED_STAGE}" in
+            init|fmt|validate|plan|apply|unknown) ;;
+            *) echo "::error::Invalid failed_stage: ${FAILED_STAGE}"; exit 1 ;;
+          esac
+          if [[ "${PROVIDER}" != "gemini" ]]; then
+            echo "::error::Unsupported provider in version 0.4.0: ${PROVIDER}"
+            exit 1
+          fi
+          if [[ "${MAX_REPAIR_ATTEMPTS}" != "0" && "${MAX_REPAIR_ATTEMPTS}" != "1" ]]; then
+            echo "::error::max_repair_attempts must be 0 or 1."
+            exit 1
+          fi
+          if [[ -z "${AWS_ROLE_ARN}" || -z "${AWS_REGION}" ]]; then
+            echo "::error::AWS_ROLE_ARN and aws_region are required."
+            exit 1
+          fi
+          if [[ -z "${GEMINI_API_KEY}" ]]; then
+            echo "::error::GEMINI_API_KEY is required."
+            exit 1
+          fi
+
+          if [[ -z "${TERRAFORM_DIR_INPUT}" \
+            || "${TERRAFORM_DIR_INPUT}" == /* \
+            || "${TERRAFORM_DIR_INPUT}" == *\\* \
+            || "${TERRAFORM_DIR_INPUT}" == *$'\n'* \
+            || "${TERRAFORM_DIR_INPUT}" == *$'\r'* ]]; then
+            echo "::error::terraform_dir must be a non-empty repository-relative POSIX path."
+            exit 1
+          fi
+          IFS='/' read -r -a terraform_parts <<< "${TERRAFORM_DIR_INPUT}"
+          for part in "${terraform_parts[@]}"; do
+            if [[ "${part}" == ".." ]]; then
+              echo "::error::terraform_dir must not contain traversal segments."
+              exit 1
+            fi
+          done
+
+          repository_root="$(realpath -e "${GITHUB_WORKSPACE}")"
+          terraform_candidate="${GITHUB_WORKSPACE}/${TERRAFORM_DIR_INPUT}"
+          if [[ ! -d "${terraform_candidate}" ]]; then
+            echo "::error::Terraform directory is not a directory: ${TERRAFORM_DIR_INPUT}"
+            exit 1
+          fi
+          terraform_root="$(realpath -e "${terraform_candidate}")"
+          case "${terraform_root}" in
+            "${repository_root}") resolved_terraform_dir="." ;;
+            "${repository_root}"/*) resolved_terraform_dir="${terraform_root#"${repository_root}/"}" ;;
+            *) echo "::error::terraform_dir resolves outside the caller repository."; exit 1 ;;
+          esac
+          shopt -s nullglob
+          terraform_files=("${terraform_root}"/*.tf "${terraform_root}"/*.tf.json)
+          if (( ${#terraform_files[@]} == 0 )); then
+            echo "::error::Terraform directory contains no .tf or .tf.json files: ${resolved_terraform_dir}"
+            exit 1
+          fi
+
+          actual_sha="$(git -C "${repository_root}" rev-parse HEAD)"
+          if [[ "${actual_sha}" != "${CHECKOUT_SHA}" ]]; then
+            echo "::error::Caller checkout mismatch: expected ${CHECKOUT_SHA}, got ${actual_sha}."
+            exit 1
+          fi
+          echo "TERRAFORM_DIR=${resolved_terraform_dir}" >> "${GITHUB_ENV}"
+
+      - name: Download Terraform failure artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: ${{ inputs.failure_log_artifact }}
+          path: ${{ env.FAILURE_ARTIFACT_DIRECTORY }}
+
+      - name: Validate downloaded failure log
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${FAILURE_LOG_PATH_INPUT}" \
+            || "${FAILURE_LOG_PATH_INPUT}" == /* \
+            || "${FAILURE_LOG_PATH_INPUT}" == *\\* \
+            || "${FAILURE_LOG_PATH_INPUT}" == *$'\n'* \
+            || "${FAILURE_LOG_PATH_INPUT}" == *$'\r'* ]]; then
+            echo "::error::failure_log_path must be a non-empty artifact-relative POSIX path."
+            exit 1
+          fi
+          IFS='/' read -r -a log_parts <<< "${FAILURE_LOG_PATH_INPUT}"
+          for part in "${log_parts[@]}"; do
+            if [[ "${part}" == ".." ]]; then
+              echo "::error::failure_log_path must not contain traversal segments."
+              exit 1
+            fi
+          done
+          artifact_root="$(realpath -e "${FAILURE_ARTIFACT_DIRECTORY}")"
+          failure_log_candidate="${FAILURE_ARTIFACT_DIRECTORY}/${FAILURE_LOG_PATH_INPUT}"
+          if [[ ! -f "${failure_log_candidate}" ]]; then
+            echo "::error::Terraform failure log is not a regular file: ${FAILURE_LOG_PATH_INPUT}"
+            exit 1
+          fi
+          failure_log="$(realpath -e "${failure_log_candidate}")"
+          case "${failure_log}" in
+            "${artifact_root}"/*) ;;
+            *) echo "::error::failure_log_path resolves outside the downloaded artifact."; exit 1 ;;
+          esac
+          echo "FAILURE_LOG=${failure_log}" >> "${GITHUB_ENV}"
+
+      - name: Build event-specific Terraform diff
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          EVENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RESULT_DIRECTORY}"
+          diff_file="${RESULT_DIRECTORY}/event.diff"
+          base_sha=""
+          head_sha=""
+          comparison=""
+
+          valid_commit() {
+            local sha="$1"
+            [[ "${sha}" =~ ^[0-9a-fA-F]{40,64}$ ]] \
+              && [[ ! "${sha}" =~ ^0+$ ]] \
+              && git cat-file -e "${sha}^{commit}" 2>/dev/null
+          }
+
+          if [[ "${EVENT_NAME}" == "pull_request" ]] \
+            && valid_commit "${PR_BASE_SHA}" \
+            && valid_commit "${PR_HEAD_SHA}"; then
+            base_sha="${PR_BASE_SHA}"
+            head_sha="${PR_HEAD_SHA}"
+            comparison="pull request ${base_sha}..${head_sha}"
+          elif [[ "${EVENT_NAME}" == "push" ]] \
+            && valid_commit "${PUSH_BEFORE_SHA}" \
+            && valid_commit "${EVENT_SHA}"; then
+            base_sha="${PUSH_BEFORE_SHA}"
+            head_sha="${EVENT_SHA}"
+            comparison="push ${base_sha}..${head_sha}"
+          fi
+
+          if [[ -n "${comparison}" ]]; then
+            GIT_LITERAL_PATHSPECS=1 git diff --no-ext-diff --unified=3 \
+              "${base_sha}" "${head_sha}" -- "${TERRAFORM_DIR}" > "${diff_file}"
+            echo "DIFF_FILE=${diff_file}" >> "${GITHUB_ENV}"
+            echo "DIFF_COMPARISON=${comparison}" >> "${GITHUB_ENV}"
+            echo "Using ${comparison}."
+          else
+            echo "::warning::GitHub event did not provide a usable base/head comparison; the agent will use its local Git fallback."
+            echo "DIFF_COMPARISON=agent local Git fallback" >> "${GITHUB_ENV}"
+          fi
+
+      - name: Authenticate to AWS with GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ inputs.aws_region }}
+          role-session-name: semantic-tf-agent-${{ github.run_id }}
+
+      - name: Run Semantic Terraform Failure Agent
+        id: diagnose
+        continue-on-error: true
+        shell: bash
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          SEMANTIC_TERRAFORM_AGENT_PASSTHROUGH_ENV: >-
+            AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY,AWS_SESSION_TOKEN,AWS_REGION,AWS_DEFAULT_REGION
+        run: |
+          set -euo pipefail
+          arguments=(
+            diagnose
+            --repo-path "${GITHUB_WORKSPACE}"
+            --terraform-dir "${TERRAFORM_DIR}"
+            --log-file "${FAILURE_LOG}"
+            --failed-stage "${FAILED_STAGE}"
+            --provider "${PROVIDER}"
+            --model "${MODEL}"
+            --context-mode "${CONTEXT_MODE}"
+            --verify-patch
+            --max-repair-attempts "${MAX_REPAIR_ATTEMPTS}"
+            --output "${RESULT_PATH}"
+          )
+          if [[ -n "${DIFF_FILE:-}" ]]; then
+            arguments+=(--diff-file "${DIFF_FILE}")
+          fi
+          semantic-terraform-agent "${arguments[@]}"
+
+      - name: Render bounded GitHub reports
+        if: always()
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [[ ! -f "${RESULT_PATH}" ]]; then
+            echo "::warning::No result.json exists to render."
+            exit 0
+          fi
+          semantic-terraform-agent render-ci \
+            --result "${RESULT_PATH}" \
+            --format summary \
+            --repository "${GITHUB_REPOSITORY}" \
+            --commit "${CHECKOUT_SHA}" \
+            --terraform-dir "${TERRAFORM_DIR}" \
+            --failed-stage "${FAILED_STAGE}" \
+            --diff-comparison "${DIFF_COMPARISON:-agent local Git fallback}" \
+            --output "${GITHUB_STEP_SUMMARY}" \
+            --append
+          if [[ "${EVENT_NAME}" == "pull_request" ]]; then
+            semantic-terraform-agent render-ci \
+              --result "${RESULT_PATH}" \
+              --format comment \
+              --repository "${GITHUB_REPOSITORY}" \
+              --commit "${CHECKOUT_SHA}" \
+              --terraform-dir "${TERRAFORM_DIR}" \
+              --failed-stage "${FAILED_STAGE}" \
+              --diff-comparison "${DIFF_COMPARISON:-agent local Git fallback}" \
+              --output "${RESULT_DIRECTORY}/comment.md"
+          fi
+
+      - name: Classify agent outcome
+        id: classify
+        if: always()
+        shell: bash
+        env:
+          DIAGNOSE_OUTCOME: ${{ steps.diagnose.outcome }}
+        run: |
+          set -euo pipefail
+          python - "${RESULT_PATH}" "${DIAGNOSE_OUTCOME}" "${GITHUB_OUTPUT}" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          from semantic_terraform_agent.security import redact_secrets
+
+          result_path = pathlib.Path(sys.argv[1])
+          diagnose_outcome = sys.argv[2]
+          output_path = pathlib.Path(sys.argv[3])
+          artifact_name = "semantic-terraform-agent-${{ github.run_id }}-${{ github.run_attempt }}"
+
+          if not result_path.is_file():
+              print("::error::The agent did not produce result.json.")
+              raise SystemExit(1)
+          result = json.loads(result_path.read_text(encoding="utf-8"))
+          result_status = result.get("status")
+          verification_status = (result.get("diagnosis") or {}).get(
+              "verification_status", "unavailable"
+          )
+          with output_path.open("a", encoding="utf-8") as output:
+              output.write(f"result_status={result_status}\n")
+              output.write(f"verification_status={verification_status}\n")
+              output.write(f"artifact_name={artifact_name}\n")
+
+          print(f"Agent result status: {result_status}")
+          print(f"Verification status: {verification_status}")
+          if diagnose_outcome != "success" or result_status != "ok":
+              error = redact_secrets(
+                  str(result.get("error") or "agent command failed")
+              )[:2000]
+              print(f"::error::Semantic Terraform Failure Agent infrastructure failure: {error}")
+              raise SystemExit(1)
+          PY
+
+      - name: Verify caller repository remained unchanged
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! actual_sha="$(git -C "${GITHUB_WORKSPACE}" rev-parse HEAD 2>/dev/null)" \
+            || [[ "${actual_sha}" != "${CHECKOUT_SHA}" ]]; then
+            echo "::warning::Exact caller checkout is unavailable; cleanliness was not evaluated."
+            exit 0
+          fi
+          changes="$(git -C "${GITHUB_WORKSPACE}" status --porcelain=v1 --untracked-files=all)"
+          if [[ -n "${changes}" ]]; then
+            echo "::error::The agent modified the caller repository."
+            while IFS= read -r change; do
+              printf '%s\n' "${change:3}"
+            done <<< "${changes}"
+            exit 1
+          fi
+          echo "Caller repository remained unchanged."
+
+      - name: Upload diagnosis artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: semantic-terraform-agent-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.RESULT_PATH }}
+            ${{ env.RESULT_DIRECTORY }}/comment.md
+          if-no-files-found: warn
+          retention-days: 30
+
+  comment:
+    name: Publish pull request diagnosis
+    needs: analyze
+    if: >-
+      ${{ always() && github.event_name == 'pull_request' &&
+      needs.analyze.result == 'success' &&
+      needs.analyze.outputs.result_status == 'ok' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Download diagnosis artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: ${{ needs.analyze.outputs.artifact_name }}
+          path: ${{ runner.temp }}/semantic-terraform-agent-report
+
+      - name: Create or update pull request comment
+        uses: actions/github-script@v8
+        env:
+          COMMENT_PATH: ${{ runner.temp }}/semantic-terraform-agent-report/comment.md
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- semantic-terraform-agent -->';
+            const body = fs.readFileSync(process.env.COMMENT_PATH, 'utf8');
+            if (!body.includes(marker)) {
+              core.setFailed('Rendered comment is missing the idempotency marker.');
+              return;
+            }
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              per_page: 100,
+            });
+            const existing = comments.find((comment) =>
+              comment.user?.login === 'github-actions[bot]' && comment.body?.includes(marker)
+            );
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }

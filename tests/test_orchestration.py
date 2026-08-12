@@ -114,6 +114,7 @@ def run_diagnosis(
     *,
     max_repair_attempts: int = 1,
     verification_enabled: bool = True,
+    failed_stage: str | None = None,
 ):
     return diagnose_repository(
         repo_path=terraform_repo,
@@ -127,6 +128,7 @@ def run_diagnosis(
         patch_verifier=verifier,
         max_repair_attempts=max_repair_attempts,
         verification_enabled=verification_enabled,
+        failed_stage=failed_stage,
     )
 
 
@@ -148,6 +150,26 @@ def test_successful_first_attempt_has_no_repair(
     assert provider.repair_calls == 0
     assert result.diagnosis.model_confidence == 0.9
     assert result.diagnosis.evidence_score == 1.0
+
+
+def test_explicit_failed_stage_overrides_log_inference(
+    terraform_repo: Path, failure_log: Path, diff_file: Path
+) -> None:
+    provider = FakeProvider()
+
+    def verifier(patch, layout, *, attempt):
+        return attempt_result(patch, attempt, status="verified")
+
+    result = run_diagnosis(
+        terraform_repo,
+        failure_log,
+        diff_file,
+        provider,
+        verifier,
+        failed_stage="validate",
+    )
+    assert result.failure.stage == "validate"
+    assert provider.request.failure.stage == "validate"
 
 
 def test_final_patch_is_the_canonical_patch_used_by_verifier(

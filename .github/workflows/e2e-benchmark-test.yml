@@ -165,6 +165,7 @@ jobs:
             --repo-path "${GITHUB_WORKSPACE}/${BENCHMARK_PATH}" \
             --terraform-dir "${BENCHMARK_CASE}" \
             --log-file "${GITHUB_WORKSPACE}/${BENCHMARK_PATH}/${BENCHMARK_LOG}" \
+            --failed-stage plan \
             --provider gemini \
             --model gemini-3.6-flash \
             --context-mode auto \

@@ -11,6 +11,11 @@ class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", protected_namespaces=(), populate_by_name=True)
 
 
+FailureStage: TypeAlias = Literal[
+    "init", "fmt", "validate", "plan", "apply", "unknown"
+]
+
+
 class RepositoryInfo(StrictModel):
     root: str
     terraform_dir: str
@@ -25,7 +30,7 @@ class FailureInfo(StrictModel):
     detail: str
     referenced_file: str | None = None
     referenced_line: int | None = None
-    stage: Literal["init", "fmt", "validate", "plan", "apply", "unknown"] = "unknown"
+    stage: FailureStage = "unknown"
     resource_address: str | None = None
     original_log: str
 

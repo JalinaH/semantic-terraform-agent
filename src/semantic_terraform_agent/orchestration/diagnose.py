@@ -18,6 +18,7 @@ from semantic_terraform_agent.models import (
     Diagnosis,
     DiagnosisCandidate,
     DiagnosisRequest,
+    FailureStage,
     FinalVerificationStatus,
     RepairRequest,
     RepositoryInfo,
@@ -181,9 +182,10 @@ def diagnose_repository(
     verification_enabled: bool = True,
     patch_verifier: PatchVerifier | None = None,
     max_repair_attempts: int = 1,
+    failed_stage: FailureStage | None = None,
 ) -> ResultDocument:
     if max_repair_attempts not in (0, 1):
-        raise InputError("max_repair_attempts must be 0 or 1 in version 0.3.0")
+        raise InputError("max_repair_attempts must be 0 or 1 in version 0.4.0")
     total_start = time.perf_counter()
     timing: dict[str, float] = {}
     warnings: list[str] = []
@@ -192,6 +194,8 @@ def diagnose_repository(
     layout = discover_repository(repo_path, terraform_dir)
     diff = collect_diff(layout, diff_file)
     failure = collect_failure_log(log_file)
+    if failed_stage is not None:
+        failure = failure.model_copy(update={"stage": failed_stage})
     all_sources = read_source_files(layout, layout.terraform_files)
     timing["collection_seconds"] = _elapsed(started)
     warnings.extend(diff.warnings)

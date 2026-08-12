@@ -12,7 +12,8 @@ implementation.
 
 ## Status and scope
 
-Version `0.3.0` implements bounded diagnosis, repair, and plan verification:
+Version `0.4.0` implements bounded diagnosis, repair, plan verification, and reusable
+GitHub Actions integration:
 
 ```text
 repository + failure log
@@ -25,11 +26,12 @@ repository + failure log
   -> isolated patch application + fmt/init/validate/plan
   -> at most one evidence-driven repair + fresh verification
   -> result JSON + concise terminal summary
+  -> optional GitHub Step Summary and idempotent pull-request comment
 ```
 
 It intentionally does **not** apply a patch to the source checkout, run Terraform apply or
-destroy, make more than two model calls, call GitHub, comment on pull requests, host a
-service, persist results, or implement an MCP server.
+destroy, make more than two model calls, commit or push code, auto-merge, host a service,
+persist results outside caller-controlled Actions artifacts, or implement an MCP server.
 
 ## Requirements and installation
 
@@ -57,6 +59,7 @@ semantic-terraform-agent diagnose \
   --terraform-dir infrastructure \
   --log-file /path/to/plan.stderr.log \
   --diff-file /path/to/change.patch \
+  --failed-stage plan \
   --provider gemini \
   --model gemini-3.6-flash \
   --context-mode auto \
@@ -84,8 +87,13 @@ identify a resource.
 The default model is `gemini-2.5-flash`; pass another Gemini model ID explicitly when
 needed. Patch verification is enabled by default. Use `--no-verify-patch` to record a
 deliberately skipped verification in environments where local commands must not run.
-`--max-repair-attempts` accepts only `0` or `1` in version 0.3.0 and defaults to `1`.
+`--max-repair-attempts` accepts only `0` or `1` in version 0.4.0 and defaults to `1`.
 Use `0` to verify the initial patch without asking the model for a repair.
+
+`--failed-stage` optionally records the caller-known stage as `init`, `fmt`, `validate`,
+`plan`, `apply`, or `unknown`. It overrides log inference and is included in the model
+context and result document. This is metadata only; it never causes the agent to run
+`terraform apply`.
 
 ## Repository discovery
 
@@ -108,6 +116,8 @@ format) and newline-delimited JSON diagnostics. It extracts:
 - referenced `.tf`/`.tf.json` file and line, when present;
 - resource address from Terraform's `with ...` diagnostic;
 - inferred stage: `init`, `fmt`, `validate`, `plan`, `apply`, or `unknown`.
+
+When the caller supplies `--failed-stage`, that explicit value replaces the inferred stage.
 
 Unstructured or malformed logs produce a conservative fallback rather than an invented
 resource. The entire caller-supplied log is preserved in `failure.original_log`; only a
@@ -370,10 +380,145 @@ environment variables plus `TF_VAR_*` into the isolated Terraform subprocesses; 
 caller environment values remain excluded, and passed values are redacted if command
 output repeats them.
 
+## GitHub Actions Integration
+
+The reusable workflow
+[`terraform-agent.yml`](.github/workflows/terraform-agent.yml) runs after a consuming
+repository has already detected a Terraform failure. It downloads that job's bounded
+failure-log artifact, checks out the exact failed commit, constructs the best event-specific
+diff, runs the exact called agent revision, uploads the result, writes a Step Summary, and—only
+for trusted same-repository pull requests—creates or updates one bot comment.
+
+### Reusable workflow API
+
+| Input | Required | Default | Purpose |
+| --- | --- | --- | --- |
+| `terraform_dir` | yes | — | Repository-relative Terraform working directory |
+| `failure_log_artifact` | yes | — | Artifact uploaded by the failed CI job |
+| `failure_log_path` | no | `terraform-plan.log` | File inside the downloaded artifact |
+| `failed_stage` | no | `plan` | `init`, `fmt`, `validate`, `plan`, `apply`, or `unknown` |
+| `terraform_version` | no | `1.15.7` | Terraform used for isolated verification |
+| `provider` | no | `gemini` | Provider-neutral interface selector; `gemini` is currently implemented |
+| `model` | no | `gemini-3.6-flash` | Provider model ID |
+| `context_mode` | no | `auto` | `lightweight`, `schema-aware`, or `auto` |
+| `max_repair_attempts` | no | `1` | Bounded value `0` or `1` |
+| `aws_region` | yes | — | Region for OIDC-authenticated Terraform verification |
+
+Required workflow secrets are `GEMINI_API_KEY` and `AWS_ROLE_ARN`. The reusable workflow
+also exposes `result_status`, `verification_status`, and `artifact_name` outputs. The
+caller must grant `contents: read` and `id-token: write`; grant `pull-requests: write` only
+to the reusable-workflow job when PR comments are desired. GitHub's built-in token is used
+for same-repository comments—no PAT is required.
+
+A minimal caller job, after a job named `terraform` uploads `terraform-failure-log`, is:
+
+```yaml
+semantic-terraform-agent:
+  needs: terraform
+  if: >-
+    ${{ always() && needs.terraform.result == 'failure' &&
+    needs.terraform.outputs.failure_detected == 'true' &&
+    (github.event_name != 'pull_request' ||
+    github.event.pull_request.head.repo.full_name == github.repository) }}
+  permissions:
+    contents: read
+    id-token: write
+    pull-requests: write
+  uses: JalinaH/semantic-terraform-agent/.github/workflows/terraform-agent.yml@main
+  with:
+    terraform_dir: infrastructure
+    failure_log_artifact: terraform-failure-log
+    failure_log_path: terraform-failure.log
+    failed_stage: ${{ needs.terraform.outputs.failed_stage }}
+    aws_region: ${{ vars.AWS_REGION }}
+  secrets:
+    GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+    AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+```
+
+For production use, pin `uses:` to a reviewed release tag or commit SHA instead of a
+mutable branch. A complete validate/plan/log-upload example is available at
+[`examples/github-actions/consumer.yml`](examples/github-actions/consumer.yml).
+
+### Failure evidence and commit/diff selection
+
+The normal Terraform job combines the failed command's stdout/stderr into one file and
+uploads it with `actions/upload-artifact`. The called workflow downloads that named
+artifact during the same run and rejects absolute paths, traversal, symlink escape, missing
+logs, control-character paths, invalid Terraform directories, and unsupported option
+values. Git pathspecs are treated literally. It never scrapes the Actions web interface.
+
+The called workflow analyzes the exact PR head SHA for pull requests and `github.sha` for
+pushes, using full history. For pull requests it supplies `git diff <base SHA> <head SHA>`;
+for pushes it supplies `git diff <event.before> <github.sha>`. Both are limited to the
+validated Terraform directory and passed with `--diff-file`. New-branch pushes, missing
+commits, and other unusable event comparisons produce an explicit warning and use the
+agent's documented local Git fallback instead.
+
+### Authentication and permissions
+
+The consuming repository configures:
+
+- repository variable `AWS_REGION`;
+- repository secret `AWS_ROLE_ARN`;
+- repository secret `GEMINI_API_KEY`.
+
+AWS credentials are obtained only through `aws-actions/configure-aws-credentials` and
+GitHub OIDC. The IAM trust policy must authorize the **consuming repository's** applicable
+branch or environment subject, because its workflow is the caller. The role should have
+only the read/plan permissions needed by that Terraform configuration. The agent sandbox
+receives only temporary AWS credential/region variables and explicitly configured
+`TF_VAR_*` values. Permanent AWS keys are neither accepted nor documented.
+
+`GEMINI_API_KEY` is scoped to the agent command step and is never printed or intentionally
+written to result JSON, summaries, comments, or artifacts. Rendered text and patches are
+bounded and passed through deterministic secret-pattern redaction before publication.
+
+### Pull requests, pushes, and exit policy
+
+For a trusted same-repository pull request, a separate job with `pull-requests: write`
+posts a concise comment containing root cause, affected resource, constraint, verification
+commands/status, confidence, evidence score, human-review warning, and a bounded collapsible
+patch. The hidden `<!-- semantic-terraform-agent -->` marker identifies the bot's prior
+comment; reruns update that comment instead of creating another.
+
+For a direct push, no PR operation is attempted. The workflow writes repository, commit,
+Terraform directory, failed stage, affected resource, context, verification, repair,
+runtime, token, and diff-comparison metadata to `$GITHUB_STEP_SUMMARY`. Suggested patches
+remain only in `result.json`; no commit or push operation exists.
+
+The analysis job fails for integration/infrastructure problems such as invalid paths or
+options, a missing artifact, Terraform/setup/OIDC failure, Gemini failure, missing result,
+or an `error` result document. A completed diagnosis with `verification_failed`,
+`patch_rejected`, `verification_unavailable`, or `verification_skipped` remains a successful
+workflow execution so humans can inspect the reported outcome. The exact status is exposed
+as a workflow output, summary/comment field, and artifact content; it is not represented as
+an agent crash.
+
+The deterministic artifact name is
+`semantic-terraform-agent-<run-id>-<run-attempt>`. It contains `result.json` and, for PRs,
+the bounded rendered comment. It never includes Terraform state, `.terraform`, provider
+caches, environment files, or credentials. A final cleanliness gate fails if the original
+caller checkout has any tracked or untracked modification.
+
+### Fork pull-request safety
+
+Repository secrets and write-capable tokens are intentionally unavailable to untrusted
+fork pull requests. Both the reusable workflow and example wrapper skip analysis when the
+PR head repository differs from the base repository. Do not replace `pull_request` with
+`pull_request_target` to run untrusted Terraform with Gemini/AWS secrets. A repository owner
+who wants to analyze a fork contribution must first adopt an explicit reviewed workflow,
+such as checking the commit onto a trusted branch after inspection.
+
+Regardless of verification status, every generated patch is a suggestion. Terraform
+verification proves only that it applied and passed the configured isolated commands; it
+does not prove developer intent. Human review and an explicit, separate application are
+always required.
+
 ## Recommended next phase
 
-Add provider-neutral verification evaluation and environment-failure classification: measure
-first-patch versus repaired-patch success across external repositories, refine the boundary
-between candidate failures and unavailable credentials/network, and optionally allow an
-explicit safe allowlist for non-secret local files needed by Terraform functions. Keep this
-local and auditable before adding any GitHub integration.
+Install this workflow in a separate Terraform repository, validate same-repository PR and
+direct-push behavior, then cut and pin a reviewed `v0.4.0` release. After that, add
+provider-neutral evaluation across real repositories and refine environment-failure
+classification. Keep the integration human-reviewed and auditable before considering a
+GitHub App or any broader automation.
