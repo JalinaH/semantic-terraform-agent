@@ -97,6 +97,9 @@ def test_structured_gemini_response_is_validated() -> None:
     assert response.token_usage.total_tokens == 15
     assert models.last_kwargs["config"]["response_mime_type"] == "application/json"
     assert "response_schema" in models.last_kwargs["config"]
+    assert not _contains_key(
+        models.last_kwargs["config"]["response_schema"], "additionalProperties"
+    )
 
 
 def test_extra_gemini_fields_are_rejected() -> None:
@@ -130,3 +133,11 @@ def test_missing_api_key_is_reported(monkeypatch) -> None:
     provider = GeminiProvider("gemini-test")
     with pytest.raises(ProviderError, match="GEMINI_API_KEY"):
         provider.diagnose(request())
+
+
+def _contains_key(value: object, key: str) -> bool:
+    if isinstance(value, dict):
+        return key in value or any(_contains_key(child, key) for child in value.values())
+    if isinstance(value, list):
+        return any(_contains_key(child, key) for child in value)
+    return False

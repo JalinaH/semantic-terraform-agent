@@ -53,7 +53,7 @@ class GeminiProvider:
 
     def _generate(self, prompt: str) -> ProviderResponse:
         client = self._client()
-        schema = ModelDiagnosis.model_json_schema()
+        schema = _gemini_response_schema()
         try:
             response = client.models.generate_content(
                 model=self.model,
@@ -81,6 +81,23 @@ class GeminiProvider:
             total_tokens=_usage_value(usage, "total_token_count"),
         )
         return ProviderResponse(diagnosis=diagnosis, token_usage=token_usage)
+
+
+def _gemini_response_schema() -> dict[str, Any]:
+    """Return the strict diagnosis schema using Gemini-supported keywords."""
+    schema = ModelDiagnosis.model_json_schema()
+    _remove_additional_properties(schema)
+    return schema
+
+
+def _remove_additional_properties(value: Any) -> None:
+    if isinstance(value, dict):
+        value.pop("additionalProperties", None)
+        for child in value.values():
+            _remove_additional_properties(child)
+    elif isinstance(value, list):
+        for child in value:
+            _remove_additional_properties(child)
 
 
 def _usage_value(usage: Any, name: str) -> int | None:
