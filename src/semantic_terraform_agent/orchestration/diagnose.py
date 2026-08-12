@@ -137,7 +137,7 @@ def _can_repair(attempt: VerificationAttempt, max_repair_attempts: int) -> bool:
     return (
         max_repair_attempts == 1
         and attempt.status == "failed"
-        and attempt.failed_stage in {"fmt", "validate", "plan"}
+        and attempt.failed_stage in {"patch_check", "fmt", "validate", "plan"}
     )
 
 

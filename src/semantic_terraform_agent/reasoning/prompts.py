@@ -39,7 +39,9 @@ def build_prompt(request: DiagnosisRequest) -> str:
 
 Use only the evidence supplied below. Do not invent files, resource addresses, provider
 constraints, or successful verification. Return a minimal candidate patch as a unified
-diff when the evidence supports one. Never suggest running terraform apply or destroy.
+diff when the evidence supports one. Every hunk header's old/new line counts must exactly
+match its context, removed, and added lines. Never suggest running terraform apply or
+destroy.
 
 Return JSON matching the supplied response schema. Evidence source must be one of:
 terraform_error, terraform_source, git_diff, provider_schema. Confidence is your model
@@ -94,7 +96,8 @@ root-cause fix.
 Use only the evidence supplied below. Preserve the original diagnosis unless the
 verification evidence directly contradicts it. Return a complete diagnosis using the same
 strict JSON response schema, with a minimal unified diff in suggested_patch. Do not invent
-successful verification and never suggest terraform apply or destroy.
+successful verification. Every hunk header's old/new line counts must exactly match its
+context, removed, and added lines. Never suggest terraform apply or destroy.
 
 Only one repair is allowed. Evidence source must be one of: terraform_error,
 terraform_source, git_diff, provider_schema. Confidence remains a model estimate between

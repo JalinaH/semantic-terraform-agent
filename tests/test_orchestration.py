@@ -86,8 +86,8 @@ def attempt_result(
 ) -> VerificationAttempt:
     failed = command("failed", f"{failed_stage} rejected the candidate")
     commands = VerificationCommands(
-        patch_check=command(),
-        patch_apply=command(),
+        patch_check=failed if failed_stage == "patch_check" else command(),
+        patch_apply=failed if failed_stage == "patch_apply" else command(),
         fmt=failed if failed_stage == "fmt" else command(),
         init=command(),
         validate=failed if failed_stage == "validate" else command(),
@@ -174,6 +174,28 @@ def test_successful_second_attempt_preserves_history_and_confidence(
     assert provider.diagnose_calls + provider.repair_calls == 2
     assert verifier_calls == 2
     assert result.token_usage.total_tokens == 30
+
+
+def test_patch_check_failure_can_trigger_one_safe_repair(
+    terraform_repo: Path, failure_log: Path, diff_file: Path
+) -> None:
+    provider = FakeProvider(diagnosis(REPAIR_PATCH, 0.72))
+
+    def verifier(patch, layout, *, attempt):
+        if attempt == 1:
+            return attempt_result(
+                patch, attempt, status="failed", failed_stage="patch_check"
+            )
+        return attempt_result(patch, attempt, status="verified")
+
+    result = run_diagnosis(terraform_repo, failure_log, diff_file, provider, verifier)
+    assert result.diagnosis.verification_status == "verified_after_retry"
+    assert [attempt.failed_stage for attempt in result.diagnosis.attempts] == [
+        "patch_check",
+        None,
+    ]
+    assert provider.repair_calls == 1
+    assert provider.repair_request.failed_attempt.commands.patch_check.status == "failed"
 
 
 def test_failed_second_attempt_never_triggers_third_call(

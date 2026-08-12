@@ -206,16 +206,18 @@ bounded stdout/stderr, and duration. Verification failure does not discard the d
 
 ## Bounded repair policy
 
-An initial failure at `fmt`, `validate`, or `plan` contains actionable evidence and may
-trigger one dedicated repair call when `--max-repair-attempts 1` is active. The repair
-prompt contains the original Terraform error, relevant source and Git diff, original root
-cause and patch, failed stage, only that command's bounded/redacted output, and relevant
-schemas in schema-aware mode. It tells the model to preserve the diagnosis unless the new
-evidence contradicts it.
+An initial failure at `git apply --check`, `fmt`, `validate`, or `plan` contains actionable
+evidence and may trigger one dedicated repair call when `--max-repair-attempts 1` is active.
+Patch-check repair applies only after the patch has already passed structural, path, and
+scope safety validation. The repair prompt contains the original Terraform error, relevant
+source and Git diff, original root cause and patch, failed stage, only that command's
+bounded/redacted output, and relevant schemas in schema-aware mode. It tells the model to
+preserve the diagnosis unless the new evidence contradicts it.
 
-No repair runs for rejected/unsafe patches, path or format violations, patch check/apply
-failures, missing Terraform, unavailable environment/provider initialization, explicit
-verification skip, init failure, malformed model output, or when retries are disabled.
+No repair runs for rejected/unsafe patches, structural/path/scope validation failures,
+patch application failures, missing Terraform, unavailable environment/provider
+initialization, explicit verification skip, init failure, malformed model output, or when
+retries are disabled.
 There is no loop or recursion: maximum model invocations are exactly two—one diagnosis and
 at most one repair. The repaired patch is subjected to the full safety checks in a new
 temporary copy.

@@ -76,6 +76,7 @@ def test_repair_prompt_contains_only_bounded_failed_command_evidence() -> None:
         )
     )
     assert "previous candidate patch did not pass Terraform verification" in prompt
+    assert "hunk header's old/new line counts must exactly" in prompt
     assert "The mode is incompatible" in prompt
     assert '"failed_verification_stage": "plan"' in prompt
     assert "registry.terraform.io/acme/acme" in prompt
@@ -83,4 +84,3 @@ def test_repair_prompt_contains_only_bounded_failed_command_evidence() -> None:
     assert "[REDACTED]" in prompt
     assert "UNRELATED_FMT_OUTPUT" not in prompt
     assert prompt.count("x") <= DEFAULT_LIMITS.max_verification_output_chars
-
