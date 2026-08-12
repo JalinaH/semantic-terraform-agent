@@ -332,8 +332,26 @@ The agent repository owns
 It is manual-only (`workflow_dispatch`) and checks out
 `JalinaH/terraform-failure-benchmarks` into a subfolder without persisted Git credentials.
 It installs Python, Terraform `1.15.7`, and this package; authenticates to AWS through OIDC;
-runs the DynamoDB benchmark diagnosis with one permitted repair; requires a verified final
-status; and uploads `result.json` even when the verification gate fails.
+runs one selected benchmark diagnosis with one permitted repair; requires a verified final
+status and successful final plan; checks that the benchmark checkout remains clean; and
+uploads `result.json` even when the verification gate fails.
+
+Use **Actions → E2E benchmark diagnosis → Run workflow** and select one of these fixed
+cases:
+
+| Selection | Terraform directory | Historical plan log | Expected resource type |
+| --- | --- | --- | --- |
+| `dynamodb-key-schema-failure` | `cases/dynamodb-key-schema-failure` | `collected-runs/terraform-logs-dynamodb-key-schema-failure/plan.stderr.log` | `aws_dynamodb_table` |
+| `ebs-throughput-volume-type-failure` | `cases/ebs-throughput-volume-type-failure` | `collected-runs/terraform-logs-ebs-throughput-volume-type-failure/plan.stderr.log` | `aws_ebs_volume` |
+| `s3-bucket-naming-conflict-failure` | `cases/s3-bucket-naming-conflict-failure` | `collected-runs/terraform-logs-s3-bucket-naming-conflict-failure/plan.stderr.log` | `aws_s3_bucket` |
+
+The workflow maps the selected identifier to these allowlisted paths rather than accepting
+arbitrary path input. It verifies the directory, Terraform files, and log before invoking
+the agent. Result assertions cover the document status, affected resource/schema type,
+non-empty final patch, deterministic verification signal, final attempt, successful plan,
+and zero plan exit code. The GitHub Step Summary contains only the case, resource, context,
+verification status, repair use, runtime, and token counts. The artifact is named
+`semantic-terraform-agent-e2e-<case>-<run-number>`.
 
 Configure the following in the **semantic-terraform-agent** repository—not the benchmark
 repository:
@@ -344,11 +362,13 @@ repository:
 - Action secret `BENCHMARK_REPO_TOKEN`, containing a fine-grained PAT with read-only
   `Contents` access to `JalinaH/terraform-failure-benchmarks`
 
-The IAM role trust policy must permit the agent repository subject, for example
-`repo:JalinaH/semantic-terraform-agent:*`. Use a plan-only least-privilege policy. The
-workflow passes only explicit ephemeral AWS environment variables plus `TF_VAR_*` into the
-isolated Terraform subprocesses; other caller environment values remain excluded, and
-passed values are redacted if command output repeats them.
+The IAM role trust policy must permit the agent repository's GitHub OIDC subject. For this
+repository on `main`, the current immutable subject is
+`repo:JalinaH@139668262/semantic-terraform-agent@1327763019:ref:refs/heads/main`. Use a
+plan-only least-privilege policy. The workflow passes only explicit ephemeral AWS
+environment variables plus `TF_VAR_*` into the isolated Terraform subprocesses; other
+caller environment values remain excluded, and passed values are redacted if command
+output repeats them.
 
 ## Recommended next phase
 
