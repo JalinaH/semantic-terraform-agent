@@ -94,11 +94,19 @@ jobs:
       AWS_REGION: ${{ inputs.aws_region }}
       TF_VAR_aws_region: ${{ inputs.aws_region }}
       CHECKOUT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-      RESULT_DIRECTORY: ${{ runner.temp }}/semantic-terraform-agent
-      RESULT_PATH: ${{ runner.temp }}/semantic-terraform-agent/result.json
-      FAILURE_ARTIFACT_DIRECTORY: ${{ runner.temp }}/semantic-terraform-agent/failure-artifact
 
     steps:
+      - name: Initialize runtime paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          runtime_directory="${RUNNER_TEMP}/semantic-terraform-agent"
+          {
+            echo "RESULT_DIRECTORY=${runtime_directory}"
+            echo "RESULT_PATH=${runtime_directory}/result.json"
+            echo "FAILURE_ARTIFACT_DIRECTORY=${runtime_directory}/failure-artifact"
+          } >> "${GITHUB_ENV}"
+
       - name: Check out exact Semantic Terraform Failure Agent revision
         uses: actions/checkout@v6
         with:
