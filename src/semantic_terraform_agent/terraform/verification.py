@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import shlex
 import shutil
 import subprocess
@@ -64,10 +65,73 @@ def _normalize_patch_path(raw: str, layout: RepositoryLayout) -> str | None:
         try:
             path.relative_to(terraform_dir)
         except ValueError as exc:
-            raise UnsafePatchError(
-                f"patch path is outside the selected Terraform directory: {value}"
-            ) from exc
+            scoped_path = terraform_dir / path
+            if scoped_path.as_posix() not in layout.terraform_files:
+                raise UnsafePatchError(
+                    f"patch path is outside the selected Terraform directory: {value}"
+                ) from exc
+            path = scoped_path
     return path.as_posix()
+
+
+def _format_patch_path(path: str, prefix: str) -> str:
+    if path == "/dev/null":
+        return path
+    value = f"{prefix}/{path}"
+    return (
+        json.dumps(value)
+        if '"' in value or any(character.isspace() for character in value)
+        else value
+    )
+
+
+def _canonicalize_patch_headers(patch: str, layout: RepositoryLayout) -> str:
+    """Use standard a/b headers with paths relative to the repository root."""
+    lines = patch.splitlines()
+    canonical: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if line.startswith("diff --git "):
+            try:
+                fields = shlex.split(line)
+            except ValueError as exc:
+                raise UnsafePatchError("invalid diff --git header") from exc
+            if len(fields) != 4:
+                raise UnsafePatchError("invalid diff --git header")
+            old_path = _normalize_patch_path(fields[2], layout)
+            new_path = _normalize_patch_path(fields[3], layout)
+            if old_path is None or new_path is None:
+                raise UnsafePatchError("diff --git paths cannot be /dev/null")
+            canonical.append(
+                f"diff --git {_format_patch_path(old_path, 'a')} "
+                f"{_format_patch_path(new_path, 'b')}"
+            )
+            index += 1
+            continue
+        if (
+            line.startswith("--- ")
+            and index + 1 < len(lines)
+            and lines[index + 1].startswith("+++ ")
+        ):
+            old_path = _normalize_patch_path(line[4:], layout)
+            new_path = _normalize_patch_path(lines[index + 1][4:], layout)
+            canonical.append(
+                "--- /dev/null"
+                if old_path is None
+                else f"--- {_format_patch_path(old_path, 'a')}"
+            )
+            canonical.append(
+                "+++ /dev/null"
+                if new_path is None
+                else f"+++ {_format_patch_path(new_path, 'b')}"
+            )
+            index += 2
+            continue
+        canonical.append(line)
+        index += 1
+    result = "\n".join(canonical)
+    return f"{result}\n"
 
 
 def validate_patch_scope(patch: str, layout: RepositoryLayout) -> list[str]:
@@ -292,6 +356,8 @@ def verify_candidate_patch(
     """Verify one candidate in a fresh filtered temporary repository copy."""
     commands = VerificationCommands()
     try:
+        changed_files = validate_patch_scope(patch, layout)
+        patch = _canonicalize_patch_headers(patch, layout)
         changed_files = validate_patch_scope(patch, layout)
     except UnsafePatchError as exc:
         return _attempt_result(

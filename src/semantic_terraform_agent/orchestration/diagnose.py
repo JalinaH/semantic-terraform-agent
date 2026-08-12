@@ -297,7 +297,7 @@ def diagnose_repository(
         initial=_candidate(initial_model),
         repair=_candidate(repair_model) if repair_model is not None else None,
         attempts=attempts,
-        final_patch=final_model.suggested_patch,
+        final_patch=final_attempt.patch,
         verification_status=verification_status,
         model_confidence=final_model.confidence,
         evidence_score=calculate_evidence_score(request, final_model),

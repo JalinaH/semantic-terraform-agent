@@ -39,6 +39,14 @@ def test_patch_scope_accepts_only_selected_terraform_directory(
     assert validate_patch_scope(candidate_patch(), layout) == ["infrastructure/main.tf"]
 
 
+def test_patch_scope_resolves_exact_terraform_directory_relative_file(
+    terraform_repo: Path,
+) -> None:
+    layout = discover_repository(terraform_repo, Path("infrastructure"))
+    relative_patch = candidate_patch().replace("infrastructure/main.tf", "main.tf")
+    assert validate_patch_scope(relative_patch, layout) == ["infrastructure/main.tf"]
+
+
 @pytest.mark.parametrize(
     "patch, message",
     [
@@ -273,3 +281,45 @@ def test_real_git_application_does_not_modify_original_repository(
     assert result.commands.patch_apply.status == "passed"
     assert result.status == "unavailable"
     assert (terraform_repo / "infrastructure/main.tf").read_text(encoding="utf-8") == original
+
+
+@pytest.mark.parametrize("path_style", ["repo-relative-without-prefix", "terraform-relative"])
+def test_git_application_canonicalizes_safe_model_path_styles(
+    monkeypatch, terraform_repo: Path, path_style: str
+) -> None:
+    git = shutil.which("git")
+    if git is None:
+        pytest.skip("Git is not installed")
+    layout = discover_repository(terraform_repo, Path("infrastructure"))
+    patch = candidate_patch()
+    if path_style == "repo-relative-without-prefix":
+        patch = patch.replace("a/infrastructure/main.tf", "infrastructure/main.tf")
+        patch = patch.replace("b/infrastructure/main.tf", "infrastructure/main.tf")
+    else:
+        patch = patch.replace("a/infrastructure/main.tf", "a/main.tf")
+        patch = patch.replace("b/infrastructure/main.tf", "b/main.tf")
+
+    monkeypatch.setattr(verification_module, "find_git", lambda: git)
+    monkeypatch.setattr(verification_module, "find_terraform", lambda: None)
+    result = verify_candidate_patch(patch, layout)
+
+    assert result.commands.patch_check.status == "passed"
+    assert result.commands.patch_apply.status == "passed"
+    assert result.patch == candidate_patch()
+
+
+def test_git_application_adds_missing_patch_document_newline(
+    monkeypatch, terraform_repo: Path
+) -> None:
+    git = shutil.which("git")
+    if git is None:
+        pytest.skip("Git is not installed")
+    layout = discover_repository(terraform_repo, Path("infrastructure"))
+    monkeypatch.setattr(verification_module, "find_git", lambda: git)
+    monkeypatch.setattr(verification_module, "find_terraform", lambda: None)
+
+    result = verify_candidate_patch(candidate_patch().rstrip("\n"), layout)
+
+    assert result.commands.patch_check.status == "passed"
+    assert result.commands.patch_apply.status == "passed"
+    assert result.patch.endswith("\n")

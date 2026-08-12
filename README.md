@@ -155,6 +155,10 @@ After Gemini returns a candidate, the verifier validates the unified-diff struct
 every path before executing a command. A patch is rejected if it is oversized, malformed,
 binary, a rename/copy, creates a symlink/submodule, touches a non-Terraform file, escapes
 the repository, or targets a file outside the selected Terraform working directory.
+Exact known files expressed relative to that working directory are resolved within it,
+then all accepted headers are canonicalized to standard `a/<repository-path>` and
+`b/<repository-path>` form before Git runs. The canonical patch is recorded as
+`diagnosis.final_patch`; the model's original text remains in its diagnosis candidate.
 
 Accepted patches are written only into a new temporary directory. That directory receives
 the same filtered Terraform configuration/lock-file copy used by inspection; it receives

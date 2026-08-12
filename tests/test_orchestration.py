@@ -150,6 +150,19 @@ def test_successful_first_attempt_has_no_repair(
     assert result.diagnosis.evidence_score == 1.0
 
 
+def test_final_patch_is_the_canonical_patch_used_by_verifier(
+    terraform_repo: Path, failure_log: Path, diff_file: Path
+) -> None:
+    provider = FakeProvider()
+
+    def verifier(patch, layout, *, attempt):
+        return attempt_result(REPAIR_PATCH, attempt, status="verified")
+
+    result = run_diagnosis(terraform_repo, failure_log, diff_file, provider, verifier)
+    assert result.diagnosis.initial.suggested_patch == INITIAL_PATCH
+    assert result.diagnosis.final_patch == REPAIR_PATCH
+
+
 def test_successful_second_attempt_preserves_history_and_confidence(
     terraform_repo: Path, failure_log: Path, diff_file: Path
 ) -> None:

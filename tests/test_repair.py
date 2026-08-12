@@ -76,7 +76,8 @@ def test_repair_prompt_contains_only_bounded_failed_command_evidence() -> None:
         )
     )
     assert "previous candidate patch did not pass Terraform verification" in prompt
-    assert "hunk header's old/new line counts must exactly" in prompt
+    assert "hunk" in prompt and "old/new line counts must exactly" in prompt
+    assert "exact repository-relative paths" in prompt
     assert "The mode is incompatible" in prompt
     assert '"failed_verification_stage": "plan"' in prompt
     assert "registry.terraform.io/acme/acme" in prompt
