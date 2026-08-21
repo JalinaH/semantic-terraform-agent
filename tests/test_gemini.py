@@ -95,6 +95,13 @@ def test_structured_gemini_response_is_validated() -> None:
     response = provider.diagnose(request())
     assert response.diagnosis.confidence == 0.8
     assert response.token_usage.total_tokens == 15
+    assert response.llm_call is not None
+    assert response.llm_call.provider.value == "gemini"
+    assert response.llm_call.call_type.value == "diagnosis"
+    assert response.llm_call.requested_model == "gemini-test"
+    assert response.llm_call.cost_usd is None
+    assert response.llm_call.system_prompt_characters == 0
+    assert response.llm_call.prompt_characters == response.llm_call.user_prompt_characters
     assert models.last_kwargs["config"]["response_mime_type"] == "application/json"
     assert "response_schema" in models.last_kwargs["config"]
     assert not _contains_key(
@@ -123,6 +130,8 @@ def test_gemini_repair_uses_dedicated_prompt_and_same_strict_schema() -> None:
     )
     response = provider.repair(repair_request())
     assert response.diagnosis.root_cause == "mode is invalid"
+    assert response.llm_call is not None
+    assert response.llm_call.call_type.value == "repair"
     assert "previous candidate patch did not pass Terraform verification" in models.last_kwargs[
         "contents"
     ]

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from enum import Enum
 from typing import Literal, TypeAlias
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -9,6 +10,29 @@ from pydantic import BaseModel, ConfigDict, Field
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", protected_namespaces=(), populate_by_name=True)
+
+
+class LLMProviderName(str, Enum):
+    GEMINI = "gemini"
+    OPENROUTER = "openrouter"
+
+
+class LLMCallType(str, Enum):
+    DIAGNOSIS = "diagnosis"
+    REPAIR = "repair"
+
+
+class ProviderFailureCategory(str, Enum):
+    MODEL_NOT_FOUND = "model_not_found"
+    MODEL_UNAVAILABLE = "model_unavailable"
+    STRUCTURED_OUTPUT_UNSUPPORTED = "structured_output_unsupported"
+    RATE_LIMITED = "rate_limited"
+    QUOTA_EXCEEDED = "quota_exceeded"
+    AUTHENTICATION_FAILED = "authentication_failed"
+    PROVIDER_UNAVAILABLE = "provider_unavailable"
+    RESPONSE_INVALID = "response_invalid"
+    TIMEOUT = "timeout"
+    NETWORK_ERROR = "network_error"
 
 
 FailureStage: TypeAlias = Literal[
@@ -161,6 +185,49 @@ class TokenUsage(StrictModel):
     total_tokens: int | None = None
 
 
+class LLMInvocation(StrictModel):
+    provider: LLMProviderName
+    requested_model: str
+    reported_model: str | None = None
+    upstream_provider: str | None = None
+    input_tokens: int | None = Field(default=None, ge=0)
+    cached_input_tokens: int | None = Field(default=None, ge=0)
+    output_tokens: int | None = Field(default=None, ge=0)
+    reasoning_tokens: int | None = Field(default=None, ge=0)
+    total_tokens: int | None = Field(default=None, ge=0)
+    cost_usd: float | None = Field(default=None, ge=0)
+    latency_ms: int = Field(ge=0)
+    cache_hit: bool | None = None
+    call_type: LLMCallType
+    prompt_characters: int = Field(ge=0)
+    system_prompt_characters: int = Field(ge=0)
+    user_prompt_characters: int = Field(ge=0)
+    finish_reason: str | None = None
+
+
+class LLMUsage(StrictModel):
+    call_count: int = Field(default=0, ge=0)
+    input_tokens: int | None = Field(default=None, ge=0)
+    cached_input_tokens: int | None = Field(default=None, ge=0)
+    output_tokens: int | None = Field(default=None, ge=0)
+    reasoning_tokens: int | None = Field(default=None, ge=0)
+    total_tokens: int | None = Field(default=None, ge=0)
+    cost_usd: float | None = Field(default=None, ge=0)
+    latency_ms: int | None = Field(default=None, ge=0)
+    token_counts_complete: bool = True
+    cost_complete: bool = True
+
+
+class ContextTelemetry(StrictModel):
+    mode: Literal["lightweight", "schema-aware"]
+    prompt_characters: int = Field(ge=0)
+    system_prompt_characters: int = Field(ge=0)
+    user_prompt_characters: int = Field(ge=0)
+    resource_schema_included: bool
+    git_diff_included: bool
+    source_file_count: int = Field(ge=0)
+
+
 class DiagnosisRequest(StrictModel):
     failure: FailureInfo
     resources: list[ResourceCandidate]
@@ -180,6 +247,7 @@ class RepairRequest(StrictModel):
 class ProviderResponse(StrictModel):
     diagnosis: ModelDiagnosis
     token_usage: TokenUsage = Field(default_factory=TokenUsage)
+    llm_call: LLMInvocation | None = None
 
 
 class ResultDocument(StrictModel):
@@ -191,5 +259,9 @@ class ResultDocument(StrictModel):
     diagnosis: Diagnosis | None = None
     timing: dict[str, float] = Field(default_factory=dict)
     token_usage: TokenUsage = Field(default_factory=TokenUsage)
+    llm_usage: LLMUsage = Field(default_factory=LLMUsage)
+    llm_calls: list[LLMInvocation] = Field(default_factory=list)
+    context_telemetry: ContextTelemetry | None = None
     warnings: list[str] = Field(default_factory=list)
     error: str | None = None
+    error_code: ProviderFailureCategory | None = None

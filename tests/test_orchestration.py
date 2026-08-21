@@ -150,6 +150,11 @@ def test_successful_first_attempt_has_no_repair(
     assert provider.repair_calls == 0
     assert result.diagnosis.model_confidence == 0.9
     assert result.diagnosis.evidence_score == 1.0
+    assert result.llm_usage.call_count == 1
+    assert result.llm_calls[0].call_type.value == "diagnosis"
+    assert result.context_telemetry.mode == "lightweight"
+    assert result.context_telemetry.git_diff_included is True
+    assert result.context_telemetry.source_file_count == 1
 
 
 def test_explicit_failed_stage_overrides_log_inference(
@@ -209,6 +214,11 @@ def test_successful_second_attempt_preserves_history_and_confidence(
     assert provider.diagnose_calls + provider.repair_calls == 2
     assert verifier_calls == 2
     assert result.token_usage.total_tokens == 30
+    assert result.llm_usage.call_count == 2
+    assert result.llm_usage.total_tokens == 30
+    assert result.llm_usage.cost_usd is None
+    assert result.llm_usage.cost_complete is False
+    assert [call.call_type.value for call in result.llm_calls] == ["diagnosis", "repair"]
 
 
 def test_patch_check_failure_can_trigger_one_safe_repair(

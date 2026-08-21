@@ -53,7 +53,10 @@ on:
     secrets:
       GEMINI_API_KEY:
         description: Gemini API key
-        required: true
+        required: false
+      OPENROUTER_API_KEY:
+        description: OpenRouter API key
+        required: false
       AWS_ROLE_ARN:
         description: AWS IAM role assumed through GitHub OIDC
         required: true
@@ -148,6 +151,7 @@ jobs:
         env:
           AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
           set -euo pipefail
 
@@ -159,10 +163,24 @@ jobs:
             init|fmt|validate|plan|apply|unknown) ;;
             *) echo "::error::Invalid failed_stage: ${FAILED_STAGE}"; exit 1 ;;
           esac
-          if [[ "${PROVIDER}" != "gemini" ]]; then
-            echo "::error::Unsupported provider in version 0.4.0: ${PROVIDER}"
-            exit 1
-          fi
+          case "${PROVIDER}" in
+            gemini)
+              if [[ -z "${GEMINI_API_KEY}" ]]; then
+                echo "::error::GEMINI_API_KEY is required for provider=gemini."
+                exit 1
+              fi
+              ;;
+            openrouter)
+              if [[ -z "${OPENROUTER_API_KEY}" ]]; then
+                echo "::error::OPENROUTER_API_KEY is required for provider=openrouter."
+                exit 1
+              fi
+              ;;
+            *)
+              echo "::error::Unsupported provider in version 0.5.0: ${PROVIDER}"
+              exit 1
+              ;;
+          esac
           if [[ "${MAX_REPAIR_ATTEMPTS}" != "0" && "${MAX_REPAIR_ATTEMPTS}" != "1" ]]; then
             echo "::error::max_repair_attempts must be 0 or 1."
             exit 1
@@ -171,11 +189,6 @@ jobs:
             echo "::error::AWS_ROLE_ARN and aws_region are required."
             exit 1
           fi
-          if [[ -z "${GEMINI_API_KEY}" ]]; then
-            echo "::error::GEMINI_API_KEY is required."
-            exit 1
-          fi
-
           if [[ -z "${TERRAFORM_DIR_INPUT}" \
             || "${TERRAFORM_DIR_INPUT}" == /* \
             || "${TERRAFORM_DIR_INPUT}" == *\\* \
@@ -317,6 +330,7 @@ jobs:
         shell: bash
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           SEMANTIC_TERRAFORM_AGENT_PASSTHROUGH_ENV: >-
             AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY,AWS_SESSION_TOKEN,AWS_REGION,AWS_DEFAULT_REGION
         run: |

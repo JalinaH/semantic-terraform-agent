@@ -2,8 +2,14 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
+
+from semantic_terraform_agent.models import (
+    LLMProviderName,
+    ProviderFailureCategory,
+)
 
 
 class AgentError(Exception):
@@ -16,6 +22,15 @@ class InputError(AgentError):
 
 class ProviderError(AgentError):
     """The configured LLM provider failed or returned invalid data."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        category: ProviderFailureCategory = ProviderFailureCategory.PROVIDER_UNAVAILABLE,
+    ) -> None:
+        super().__init__(message)
+        self.category = category
 
 
 @dataclass(frozen=True)
@@ -31,6 +46,41 @@ class Limits:
 
 
 DEFAULT_LIMITS = Limits()
+
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+MAX_MODEL_ID_LENGTH = 200
+_OPENROUTER_MODEL_ID = re.compile(
+    r"^~?[A-Za-z0-9][A-Za-z0-9._~-]*/[A-Za-z0-9][A-Za-z0-9._:+~-]*$"
+)
+
+
+def provider_names() -> tuple[str, ...]:
+    return tuple(provider.value for provider in LLMProviderName)
+
+
+def parse_provider_name(value: str | LLMProviderName) -> LLMProviderName:
+    if isinstance(value, LLMProviderName):
+        return value
+    try:
+        return LLMProviderName(value)
+    except ValueError as exc:
+        supported = ", ".join(provider_names())
+        raise InputError(f"unsupported provider {value!r}; choose one of: {supported}") from exc
+
+
+def validate_model_id(provider: str | LLMProviderName, model: str) -> str:
+    provider_name = parse_provider_name(provider)
+    if not model or len(model) > MAX_MODEL_ID_LENGTH:
+        raise InputError(
+            f"model ID must contain between 1 and {MAX_MODEL_ID_LENGTH} characters"
+        )
+    if any(character.isspace() or ord(character) < 32 or ord(character) == 127 for character in model):
+        raise InputError("model ID must not contain whitespace or control characters")
+    if provider_name is LLMProviderName.OPENROUTER and not _OPENROUTER_MODEL_ID.fullmatch(model):
+        raise InputError(
+            "OpenRouter model ID must use the provider/model form, optionally with a variant such as :free"
+        )
+    return model
 
 
 def resolve_existing_file(path: Path, *, label: str, max_bytes: int) -> Path:

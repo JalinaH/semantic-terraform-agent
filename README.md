@@ -3,7 +3,7 @@
 Semantic Terraform Failure Agent is a local CLI that diagnoses a Terraform failure in
 an arbitrary checked-out repository. It combines the Terraform diagnostic, relevant
 source and Git changes, and—when useful—only the affected provider resource schemas.
-Gemini produces a validated diagnosis and candidate patch; the agent checks that patch
+The selected LLM provider produces a validated diagnosis and candidate patch; the agent checks that patch
 inside an isolated copy and writes a stable JSON result for downstream tooling.
 
 This repository is the reusable product. It has no dependency on a benchmark case ID,
@@ -12,8 +12,9 @@ implementation.
 
 ## Status and scope
 
-Version `0.4.0` implements bounded diagnosis, repair, plan verification, and reusable
-GitHub Actions integration:
+Version `0.5.0` adds OpenRouter and trustworthy per-invocation/aggregate usage telemetry
+while preserving direct Gemini support, bounded diagnosis and repair, plan verification,
+and reusable GitHub Actions integration:
 
 ```text
 repository + failure log
@@ -22,10 +23,10 @@ repository + failure log
   -> candidate resource blocks
   -> deterministic context selection
   -> selective schema inspection (when selected)
-  -> Gemini structured diagnosis
+  -> provider-neutral Gemini or OpenRouter structured diagnosis
   -> isolated patch application + fmt/init/validate/plan
   -> at most one evidence-driven repair + fresh verification
-  -> result JSON + concise terminal summary
+  -> result JSON + concise terminal and LLM usage summary
   -> optional GitHub Step Summary and idempotent pull-request comment
 ```
 
@@ -38,7 +39,7 @@ persist results outside caller-controlled Actions artifacts, or implement an MCP
 - Python 3.11 or newer
 - Git and Terraform on `PATH` for patch verification
 - Terraform on `PATH` for schema-aware diagnosis
-- `GEMINI_API_KEY` in the environment
+- `OPENROUTER_API_KEY` for OpenRouter, or `GEMINI_API_KEY` for direct Gemini
 
 From this directory:
 
@@ -46,10 +47,10 @@ From this directory:
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -e '.[dev]'
-export GEMINI_API_KEY='your-key'
+export OPENROUTER_API_KEY='your-key'
 ```
 
-The key is read at request time. The CLI never prints or stores it.
+Keys are read at request time. The CLI never prints or stores them.
 
 ## CLI usage
 
@@ -60,8 +61,8 @@ semantic-terraform-agent diagnose \
   --log-file /path/to/plan.stderr.log \
   --diff-file /path/to/change.patch \
   --failed-stage plan \
-  --provider gemini \
-  --model gemini-3.6-flash \
+  --provider openrouter \
+  --model '<provider>/<model>:free' \
   --context-mode auto \
   --verify-patch \
   --max-repair-attempts 1 \
@@ -84,16 +85,145 @@ identify a resource.
 - `schema-aware`: adds matched resource schemas and provider metadata.
 - `auto`: applies the deterministic policy described below.
 
-The default model is `gemini-2.5-flash`; pass another Gemini model ID explicitly when
-needed. Patch verification is enabled by default. Use `--no-verify-patch` to record a
+The default Gemini model is `gemini-2.5-flash`. OpenRouter requires an explicit dynamic
+model ID in `provider/model` form; the agent does not maintain a fixed model allowlist.
+Patch verification is enabled by default. Use `--no-verify-patch` to record a
 deliberately skipped verification in environments where local commands must not run.
-`--max-repair-attempts` accepts only `0` or `1` in version 0.4.0 and defaults to `1`.
+`--max-repair-attempts` accepts only `0` or `1` in version 0.5.0 and defaults to `1`.
 Use `0` to verify the initial patch without asking the model for a repair.
 
 `--failed-stage` optionally records the caller-known stage as `init`, `fmt`, `validate`,
 `plan`, `apply`, or `unknown`. It overrides log inference and is included in the model
 context and result document. This is metadata only; it never causes the agent to run
 `terraform apply`.
+
+## OpenRouter and provider architecture
+
+The orchestration layer depends only on the `LLMProvider` protocol. Provider creation is
+centralized, and OpenRouter-specific HTTP, retry, structured-output, error, and usage
+handling lives in `reasoning/openrouter.py`; direct Gemini remains in
+`reasoning/gemini.py`. Adding a future provider does not require putting provider HTTP
+logic into diagnosis orchestration.
+
+OpenRouter uses the official non-streaming `POST /api/v1/chat/completions` endpoint and
+reads `OPENROUTER_API_KEY`. Optional app attribution is read from:
+
+- `OPENROUTER_APP_URL`, sent as `HTTP-Referer`;
+- `OPENROUTER_APP_NAME`, sent as `X-OpenRouter-Title`.
+
+Neither attribution value is required. The API endpoint has an injectable base URL for
+offline tests; normal CLI operation always uses the official default. API keys,
+authorization headers, raw request bodies, and complete provider responses are never
+placed in result telemetry.
+
+OpenRouter model IDs remain dynamic because catalog availability changes. The CLI accepts
+conservatively validated IDs such as `<provider>/<model>` and
+`<provider>/<model>:free`, as well as `openrouter/free`. Control characters, whitespace,
+malformed unqualified IDs, and IDs longer than 200 characters are rejected locally.
+Tier policy and model allowlisting belong to the future dashboard, not the agent core.
+
+For zero-cost development, either select a currently available fixed `:free` model or use
+`openrouter/free`:
+
+```bash
+export OPENROUTER_API_KEY='your-key'
+semantic-terraform-agent diagnose \
+  --repo-path /path/to/repository \
+  --terraform-dir infrastructure \
+  --log-file /path/to/plan.stderr.log \
+  --provider openrouter \
+  --model 'openrouter/free' \
+  --context-mode auto \
+  --verify-patch \
+  --max-repair-attempts 1 \
+  --output result.json
+```
+
+`openrouter/free` chooses an available free model and may report a different underlying
+model on each run. A fixed free model ID is preferable for reproducible benchmarking.
+Free availability and rate limits can change, and not every free model follows structured
+output equally well.
+
+The OpenRouter adapter first requests strict `json_schema` structured output and requires
+a route that supports the parameter. When OpenRouter reports that the selected model
+cannot enforce structured output, the adapter makes one capability fallback request
+without `response_format`, includes the complete diagnosis schema in a JSON-only prompt,
+parses the returned JSON, and validates it with the same strict Pydantic model. Malformed,
+missing-field, or extra-field responses are rejected; schema validation is never weakened.
+
+OpenRouter transport retry is separate from Terraform patch repair. A transport request
+may retry at most twice after `408`, `429`, `500`, `502`, `503`, `504`, timeout, or network
+failure, with capped exponential backoff and bounded `Retry-After` handling. The agent
+still permits at most one evidence-driven repair model invocation after Terraform
+verification failure. Neither mechanism is an unbounded loop.
+
+Provider failures are normalized to safe categories: `model_not_found`,
+`model_unavailable`, `structured_output_unsupported`, `rate_limited`, `quota_exceeded`,
+`authentication_failed`, `provider_unavailable`, `response_invalid`, `timeout`, and
+`network_error`. CLI error documents expose the category as `error_code` without a raw
+provider stack trace. OpenRouter is never silently replaced by Gemini after a failure.
+
+## LLM usage and context telemetry
+
+Every successful diagnosis and repair invocation is recorded in `llm_calls` with:
+
+- provider, requested model, provider-reported model, and upstream provider when reported;
+- input, cached-input, output, reasoning, and total tokens when reported;
+- provider-reported cost, latency, cache status, finish reason, and `call_type`;
+- deterministic total, system, and user prompt character counts measured before the call.
+
+Run-level `llm_usage` sums known numeric values across diagnosis and repair. `call_count`
+and aggregate latency cover all recorded calls. `token_counts_complete` is false when a
+call omitted a core input/output/total token count. `cost_complete` is false when any call
+omitted cost; in that case `cost_usd` is either the explicitly incomplete sum of reported
+costs or `null` when no cost was reported. An explicit free-model cost of zero remains
+`0.0` and renders as `$0.000000`; unknown cost remains `null` and renders as
+`not reported`. The agent uses provider-reported cost and does not embed a pricing table.
+
+`token_usage` remains for backward compatibility and is derived from the aggregate
+input/output/total counts. `context_telemetry` records selected mode, prompt character
+counts, whether resource schema and Git diff evidence were included, and source-file
+count. These fields establish a v0.5 baseline without implementing context minimization.
+
+An abbreviated result is:
+
+```json
+{
+  "token_usage": {"input_tokens": 1842, "output_tokens": 218, "total_tokens": 2060},
+  "llm_usage": {
+    "call_count": 1,
+    "input_tokens": 1842,
+    "cached_input_tokens": 0,
+    "output_tokens": 218,
+    "reasoning_tokens": 0,
+    "total_tokens": 2060,
+    "cost_usd": 0.0,
+    "latency_ms": 1821,
+    "token_counts_complete": true,
+    "cost_complete": true
+  },
+  "llm_calls": [
+    {
+      "provider": "openrouter",
+      "requested_model": "openrouter/free",
+      "reported_model": "<provider-reported-model>",
+      "call_type": "diagnosis"
+    }
+  ],
+  "context_telemetry": {
+    "mode": "lightweight",
+    "resource_schema_included": false,
+    "git_diff_included": true,
+    "source_file_count": 1
+  }
+}
+```
+
+For the hosted product, the dashboard/worker owns `OPENROUTER_API_KEY`, applies the future
+model policy, and invokes this non-interactive CLI with the selected model. Customer
+repositories do not need OpenRouter or Gemini keys. CLI/self-hosted and reusable-workflow
+users provide the selected provider key in their own execution environment. No dashboard
+code is changed by this agent release.
 
 ## Repository discovery
 
@@ -121,7 +251,7 @@ When the caller supplies `--failed-stage`, that explicit value replaces the infe
 
 Unstructured or malformed logs produce a conservative fallback rather than an invented
 resource. The entire caller-supplied log is preserved in `failure.original_log`; only a
-bounded, redacted excerpt is sent to Gemini.
+bounded, redacted excerpt is sent to the selected LLM provider.
 
 ## Resource detection
 
@@ -161,7 +291,7 @@ available lightweight evidence; they do not modify the source repository.
 
 ## Isolated patch verification
 
-After Gemini returns a candidate, the verifier validates the unified-diff structure and
+After the selected provider returns a candidate, the verifier validates the unified-diff structure and
 every path before executing a command. A patch is rejected if it is oversized, malformed,
 binary, a rename/copy, creates a symlink/submodule, touches a non-Terraform file, escapes
 the repository, or targets a file outside the selected Terraform working directory.
@@ -267,14 +397,15 @@ It selects schema-aware context when resource detection is absent or plural, evi
 weaker, or a provider validation diagnostic is ambiguous. The reason is always written to
 `context.selection_reason`. No LLM call is spent choosing the mode.
 
-## Gemini and structured output
+## Direct Gemini support
 
-`GeminiProvider` implements the provider-neutral `LLMProvider` protocol. Future OpenAI,
-Claude, or local integrations can implement its `diagnose(DiagnosisRequest)` and
-`repair(RepairRequest)` methods.
-Gemini is asked for JSON using an SDK response schema, and the returned value is validated
-again with a strict Pydantic model. Missing fields, out-of-range confidence, invalid
-evidence sources, or arbitrary extra fields reject the response.
+`GeminiProvider` remains a first-class implementation of the same provider-neutral
+`LLMProvider` protocol. It reads `GEMINI_API_KEY`, uses the Gemini SDK response schema,
+validates the returned value again with the strict Pydantic contract, and emits the same
+per-call telemetry shape. Gemini does not report cost through this integration, so its
+`cost_usd` is `null` and `cost_complete` is false for a run containing Gemini calls.
+Missing fields, out-of-range confidence, invalid evidence sources, or arbitrary extra
+fields reject either provider's response.
 
 The output document includes repository/diff metadata, Terraform/schema metadata, parsed
 failure, selected context and reason, diagnosis, nested patch verification, timings, token
@@ -304,26 +435,30 @@ non-Terraform local files may fail and will be reported as such.
 python -m pytest
 ```
 
-The suite uses temporary arbitrary repositories and mocked Gemini/Terraform boundaries;
+The suite uses temporary arbitrary repositories and mocked OpenRouter/Gemini/Terraform boundaries;
 normal tests require no API key, network, cloud credentials, or installed Terraform CLI.
 Coverage includes discovery, traversal rejection, diff lines, human/JSON/malformed logs,
 unknown and multiple resources, schema selection/missing CLI, all context modes, strict
-Gemini JSON, missing API key, isolated patch application, plan flags/gating, unsafe first
+provider JSON, OpenRouter request construction, structured-output fallback, categorized
+errors, bounded transport retries, free/unknown cost handling, secret safety, usage
+aggregation, missing API keys, isolated patch application, plan flags/gating, unsafe first
 and second patches, state and `.terraform` exclusion, output redaction, missing Terraform,
 real Git application, complete attempt history, final status mapping, malformed repair,
-and the exact one-retry/model-call bound.
+and the exact one-repair bound.
 
 ## Running against the existing benchmark repository
 
-From this repository's directory, with Terraform installed and `GEMINI_API_KEY` exported:
+From this repository's directory, with Terraform installed and `OPENROUTER_API_KEY`
+exported, this exact command tests the current free router without hardcoding a transient
+catalog entry:
 
 ```bash
 semantic-terraform-agent diagnose \
   --repo-path ../terraform-failure-benchmarks \
   --terraform-dir cases/dynamodb-key-schema-failure \
   --log-file ../terraform-failure-benchmarks/collected-runs/terraform-logs-dynamodb-key-schema-failure/plan.stderr.log \
-  --provider gemini \
-  --model gemini-3.6-flash \
+  --provider openrouter \
+  --model openrouter/free \
   --context-mode auto \
   --max-repair-attempts 1 \
   --output benchmark-result.json
@@ -398,13 +533,14 @@ for trusted same-repository pull requests—creates or updates one bot comment.
 | `failure_log_path` | no | `terraform-plan.log` | File inside the downloaded artifact |
 | `failed_stage` | no | `plan` | `init`, `fmt`, `validate`, `plan`, `apply`, or `unknown` |
 | `terraform_version` | no | `1.15.7` | Terraform used for isolated verification |
-| `provider` | no | `gemini` | Provider-neutral interface selector; `gemini` is currently implemented |
-| `model` | no | `gemini-3.6-flash` | Provider model ID |
+| `provider` | no | `gemini` | Provider-neutral selector: `gemini` or `openrouter` |
+| `model` | no | `gemini-3.6-flash` | Dynamic provider model ID; override for OpenRouter |
 | `context_mode` | no | `auto` | `lightweight`, `schema-aware`, or `auto` |
 | `max_repair_attempts` | no | `1` | Bounded value `0` or `1` |
 | `aws_region` | yes | — | Region for OIDC-authenticated Terraform verification |
 
-Required workflow secrets are `GEMINI_API_KEY` and `AWS_ROLE_ARN`. The reusable workflow
+Required workflow secrets are `AWS_ROLE_ARN` plus the selected provider key:
+`GEMINI_API_KEY` or `OPENROUTER_API_KEY`. The reusable workflow
 also exposes `result_status`, `verification_status`, and `artifact_name` outputs. The
 caller must grant `contents: read` and `id-token: write`; grant `pull-requests: write` only
 to the reusable-workflow job when PR comments are desired. GitHub's built-in token is used
@@ -439,6 +575,8 @@ semantic-terraform-agent:
 For production use, pin `uses:` to a reviewed release tag or commit SHA instead of a
 mutable branch. A complete validate/plan/log-upload example is available at
 [`examples/github-actions/consumer.yml`](examples/github-actions/consumer.yml).
+To use OpenRouter, set `provider: openrouter`, set an explicit `model`, and pass
+`OPENROUTER_API_KEY` instead of `GEMINI_API_KEY` in the caller's `secrets` mapping.
 
 ### Failure evidence and commit/diff selection
 
@@ -461,7 +599,7 @@ The consuming repository configures:
 
 - repository variable `AWS_REGION`;
 - repository secret `AWS_ROLE_ARN`;
-- repository secret `GEMINI_API_KEY`.
+- repository secret `GEMINI_API_KEY` or `OPENROUTER_API_KEY`, matching `provider`.
 
 AWS credentials are obtained only through `aws-actions/configure-aws-credentials` and
 GitHub OIDC. The IAM trust policy must authorize the **consuming repository's** applicable
@@ -470,7 +608,7 @@ only the read/plan permissions needed by that Terraform configuration. The agent
 receives only temporary AWS credential/region variables and explicitly configured
 `TF_VAR_*` values. Permanent AWS keys are neither accepted nor documented.
 
-`GEMINI_API_KEY` is scoped to the agent command step and is never printed or intentionally
+The selected LLM key is scoped to the agent command step and is never printed or intentionally
 written to result JSON, summaries, comments, or artifacts. Rendered text and patches are
 bounded and passed through deterministic secret-pattern redaction before publication.
 
@@ -488,7 +626,7 @@ runtime, token, and diff-comparison metadata to `$GITHUB_STEP_SUMMARY`. Suggeste
 remain only in `result.json`; no commit or push operation exists.
 
 The analysis job fails for integration/infrastructure problems such as invalid paths or
-options, a missing artifact, Terraform/setup/OIDC failure, Gemini failure, missing result,
+options, a missing artifact, Terraform/setup/OIDC failure, LLM provider failure, missing result,
 or an `error` result document. A completed diagnosis with `verification_failed`,
 `patch_rejected`, `verification_unavailable`, or `verification_skipped` remains a successful
 workflow execution so humans can inspect the reported outcome. The exact status is exposed
@@ -506,7 +644,7 @@ caller checkout has any tracked or untracked modification.
 Repository secrets and write-capable tokens are intentionally unavailable to untrusted
 fork pull requests. Both the reusable workflow and example wrapper skip analysis when the
 PR head repository differs from the base repository. Do not replace `pull_request` with
-`pull_request_target` to run untrusted Terraform with Gemini/AWS secrets. A repository owner
+`pull_request_target` to run untrusted Terraform with LLM/AWS secrets. A repository owner
 who wants to analyze a fork contribution must first adopt an explicit reviewed workflow,
 such as checking the commit onto a trusted branch after inspection.
 
@@ -517,8 +655,9 @@ always required.
 
 ## Recommended next phase
 
-Install this workflow in a separate Terraform repository, validate same-repository PR and
-direct-push behavior, then cut and pin a reviewed `v0.4.0` release. After that, add
-provider-neutral evaluation across real repositories and refine environment-failure
-classification. Keep the integration human-reviewed and auditable before considering a
-GitHub App or any broader automation.
+Start v0.6 by using `context_telemetry` and the per-call token baseline to measure prompt
+sections on the three benchmark failures, then implement deterministic minimal-context
+selection with regression tests for diagnosis quality and verified patches. Add progressive
+context escalation and schema slicing only after that baseline is stable. LLMLingua,
+semantic caching, automatic premium routing, billing, dashboard charts, and hard budgets
+remain explicitly deferred.

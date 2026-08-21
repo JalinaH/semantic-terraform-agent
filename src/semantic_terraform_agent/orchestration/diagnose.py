@@ -13,23 +13,39 @@ from semantic_terraform_agent.collectors.repository import (
     discover_repository,
     read_source_files,
 )
-from semantic_terraform_agent.config import InputError
+from semantic_terraform_agent.config import (
+    InputError,
+    parse_provider_name,
+    validate_model_id,
+)
 from semantic_terraform_agent.models import (
     Diagnosis,
     DiagnosisCandidate,
     DiagnosisRequest,
     FailureStage,
     FinalVerificationStatus,
+    LLMCallType,
+    LLMInvocation,
+    LLMProviderName,
     RepairRequest,
     RepositoryInfo,
     ResultDocument,
-    TokenUsage,
     VerificationAttempt,
     VerificationCommands,
     VerificationSignal,
 )
 from semantic_terraform_agent.reasoning.base import LLMProvider
-from semantic_terraform_agent.reasoning.gemini import GeminiProvider
+from semantic_terraform_agent.reasoning.factory import create_llm_provider
+from semantic_terraform_agent.reasoning.prompts import (
+    build_prompt_parts,
+    build_repair_prompt_parts,
+)
+from semantic_terraform_agent.reasoning.usage import (
+    aggregate_usage,
+    build_context_telemetry,
+    invocation_from_response,
+    legacy_token_usage,
+)
 from semantic_terraform_agent.terraform.discovery import select_context_mode
 from semantic_terraform_agent.terraform.resources import detect_resources
 from semantic_terraform_agent.terraform.schema import inspect_schemas
@@ -106,22 +122,6 @@ def _candidate(diagnosis) -> DiagnosisCandidate:
     )
 
 
-def _add_token_usage(left: TokenUsage, right: TokenUsage | None) -> TokenUsage:
-    if right is None:
-        return left
-
-    def add(first: int | None, second: int | None) -> int | None:
-        if first is None and second is None:
-            return None
-        return (first or 0) + (second or 0)
-
-    return TokenUsage(
-        input_tokens=add(left.input_tokens, right.input_tokens),
-        output_tokens=add(left.output_tokens, right.output_tokens),
-        total_tokens=add(left.total_tokens, right.total_tokens),
-    )
-
-
 def _unavailable_attempt(patch: str, attempt: int, error: Exception) -> VerificationAttempt:
     return VerificationAttempt(
         attempt=attempt,
@@ -175,7 +175,7 @@ def diagnose_repository(
     terraform_dir: Path,
     log_file: Path,
     diff_file: Path | None,
-    provider_name: Literal["gemini"],
+    provider_name: str | LLMProviderName,
     model: str,
     context_mode: Literal["lightweight", "schema-aware", "auto"],
     llm_provider: LLMProvider | None = None,
@@ -185,7 +185,9 @@ def diagnose_repository(
     failed_stage: FailureStage | None = None,
 ) -> ResultDocument:
     if max_repair_attempts not in (0, 1):
-        raise InputError("max_repair_attempts must be 0 or 1 in version 0.4.0")
+        raise InputError("max_repair_attempts must be 0 or 1 in version 0.5.0")
+    selected_provider = parse_provider_name(provider_name)
+    selected_model = validate_model_id(selected_provider, model)
     total_start = time.perf_counter()
     timing: dict[str, float] = {}
     warnings: list[str] = []
@@ -230,17 +232,26 @@ def diagnose_repository(
         schemas=terraform_info.schemas,
         terraform_version=terraform_info.version,
     )
+    llm_calls: list[LLMInvocation] = []
     started = time.perf_counter()
     if llm_provider is None:
-        if provider_name != "gemini":
-            raise ValueError(f"unsupported provider: {provider_name}")
-        llm_provider = GeminiProvider(model=model)
+        llm_provider = create_llm_provider(selected_provider, selected_model)
+    diagnosis_prompt = build_prompt_parts(request)
     provider_response = llm_provider.diagnose(request)
     timing["llm_seconds"] = _elapsed(started)
+    llm_calls.append(
+        invocation_from_response(
+            provider_response,
+            provider=selected_provider,
+            requested_model=selected_model,
+            call_type=LLMCallType.DIAGNOSIS,
+            prompt=diagnosis_prompt,
+            latency_ms=round(timing["llm_seconds"] * 1000),
+        )
+    )
     initial_model = provider_response.diagnosis
     final_model = initial_model
     repair_model = None
-    token_usage = provider_response.token_usage
 
     started = time.perf_counter()
     verifier = patch_verifier or verify_candidate_patch
@@ -261,23 +272,31 @@ def diagnose_repository(
 
     if _can_repair(first_attempt, max_repair_attempts):
         started = time.perf_counter()
+        repair_request = RepairRequest(
+            original=request,
+            previous_diagnosis=initial_model,
+            failed_attempt=first_attempt,
+        )
         try:
-            repair_response = llm_provider.repair(
-                RepairRequest(
-                    original=request,
-                    previous_diagnosis=initial_model,
-                    failed_attempt=first_attempt,
-                )
-            )
+            repair_response = llm_provider.repair(repair_request)
             repair_model = repair_response.diagnosis
             final_model = repair_model
-            token_usage = _add_token_usage(token_usage, repair_response.token_usage)
         except Exception as exc:  # A malformed/failed repair must preserve attempt one.
             repair_error = f"Repair model call failed: {exc}"
             warnings.append(repair_error)
         timing["repair_llm_seconds"] = _elapsed(started)
 
         if repair_model is not None:
+            llm_calls.append(
+                invocation_from_response(
+                    repair_response,
+                    provider=selected_provider,
+                    requested_model=selected_model,
+                    call_type=LLMCallType.REPAIR,
+                    prompt=build_repair_prompt_parts(repair_request),
+                    latency_ms=round(timing["repair_llm_seconds"] * 1000),
+                )
+            )
             started = time.perf_counter()
             try:
                 second_attempt = verifier(repair_model.suggested_patch, layout, attempt=2)
@@ -310,6 +329,7 @@ def diagnose_repository(
         ),
     )
     timing["total_seconds"] = _elapsed(total_start)
+    llm_usage = aggregate_usage(llm_calls)
     return ResultDocument(
         status="ok",
         repository=RepositoryInfo(
@@ -325,6 +345,9 @@ def diagnose_repository(
         context=context,
         diagnosis=diagnosis,
         timing=timing,
-        token_usage=token_usage,
+        token_usage=legacy_token_usage(llm_usage),
+        llm_usage=llm_usage,
+        llm_calls=llm_calls,
+        context_telemetry=build_context_telemetry(request, llm_calls[0]),
         warnings=warnings,
     )
