@@ -442,6 +442,7 @@ class VerificationAttempt(StrictModel):
     commands: VerificationCommands = Field(default_factory=VerificationCommands)
     temporary_copy_cleaned: bool
     warnings: list[str] = Field(default_factory=list)
+    candidate_source: Literal["llm", "verified_failure_memory"] = "llm"
 
 
 class DiagnosisCandidate(StrictModel):
@@ -586,6 +587,46 @@ class ProviderResponse(StrictModel):
     llm_call: LLMInvocation | None = None
 
 
+CacheStatus: TypeAlias = Literal[
+    "disabled",
+    "ineligible",
+    "miss",
+    "hit",
+    "hit_verified",
+    "hit_stale",
+    "read_error",
+    "write_error",
+    "not_requested",
+]
+
+
+class CacheComponentTelemetry(StrictModel):
+    status: CacheStatus
+    format_version: str
+    lookup_seconds: float = Field(default=0.0, ge=0.0)
+    write_seconds: float = Field(default=0.0, ge=0.0)
+    write_status: Literal["not_attempted", "stored", "duplicate", "write_error"] = (
+        "not_attempted"
+    )
+
+
+class FailureMemoryTelemetry(CacheComponentTelemetry):
+    fingerprint: str | None = None
+    reused: bool = False
+    fresh_verification_passed: bool | None = None
+    reuse_attempt: VerificationAttempt | None = None
+    llm_calls_avoided: int = Field(default=0, ge=0, le=1)
+    historical_input_tokens_avoided: int | None = Field(default=None, ge=0)
+    historical_total_tokens_avoided: int | None = Field(default=None, ge=0)
+    historical_cost_avoided_usd: float | None = Field(default=None, ge=0.0)
+
+
+class CacheTelemetry(StrictModel):
+    failure_memory: FailureMemoryTelemetry
+    provider_schema: CacheComponentTelemetry
+    schema_slice: CacheComponentTelemetry
+
+
 class ResultDocument(StrictModel):
     status: Literal["ok", "error"]
     repository: RepositoryInfo | None = None
@@ -604,6 +645,8 @@ class ResultDocument(StrictModel):
     schema_optimization: SchemaOptimization | None = None
     context_progression: ContextProgression | None = None
     model_progression: ModelProgression | None = None
+    resolution_source: Literal["llm", "verified_failure_memory"] | None = None
+    cache: CacheTelemetry | None = None
     warnings: list[str] = Field(default_factory=list)
     error: str | None = None
     error_code: ProviderFailureCategory | None = None

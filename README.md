@@ -12,13 +12,11 @@ implementation.
 
 ## Status and scope
 
-Version `0.9.0` adds deterministic cost-tier model routing as a policy independent from
-progressive context escalation. Fixed routing remains the default and preserves v0.8's
-same-model behavior. Auto routing selects the cheapest eligible configured model, keeps
-formatting repair on that model, and may move a schema/context escalation to the next
-eligible tier without exceeding the caller's ceiling. Routing reads a strict local
-registry and performs no provider catalog request. The hard limit remains two semantic
-model calls, and actual cost remains provider-reported rather than estimated.
+Version `1.0.0` adds conservative exact-match Verified Failure Memory and versioned
+deterministic caches for provider schemas and schema slices. A remembered patch is never
+trusted blindly: it must pass fresh isolated verification against the current checkout.
+Only then can a run finish with zero LLM calls. Misses and stale or corrupt entries fall
+back to the unchanged v0.9 policies with the full two-call budget.
 
 ```text
 repository + failure log
@@ -28,6 +26,8 @@ repository + failure log
   -> affected resource block(s)
   -> direct var/local/data/resource definitions (depth 1)
   -> deterministic context selection
+  -> exact repository-scoped failure fingerprint and optional memory lookup
+  -> fresh isolated verification of any remembered patch
   -> local model-registry filtering and deterministic initial model selection
   -> provider-neutral Gemini or OpenRouter structured diagnosis with minimal context
   -> isolated patch application + fmt/init/validate/plan
@@ -38,9 +38,10 @@ repository + failure log
   -> optional GitHub Step Summary and idempotent pull-request comment
 ```
 
-It intentionally does **not** apply a patch to the source checkout, run Terraform apply or
+It intentionally does **not** perform semantic/fuzzy cache matching, apply a patch to the source checkout, run Terraform apply or
 destroy, make more than two model calls, commit or push code, auto-merge, host a service,
-persist results outside caller-controlled Actions artifacts, or implement an MCP server.
+persist cross-run data unless an explicit cache directory is configured, or implement an
+MCP server.
 
 ## Requirements and installation
 
@@ -76,6 +77,8 @@ semantic-terraform-agent diagnose \
   --context-mode auto \
   --verify-patch \
   --max-repair-attempts 1 \
+  --cache-dir /safe/local/cache \
+  --failure-memory \
   --output result.json
 ```
 
@@ -100,7 +103,7 @@ explicit dynamic model ID in `provider/model` form; auto routing may choose from
 registry.
 Patch verification is enabled by default. Use `--no-verify-patch` to record a
 deliberately skipped verification in environments where local commands must not run.
-`--max-repair-attempts` accepts only `0` or `1` in version 0.9.0 and defaults to `1`.
+`--max-repair-attempts` accepts only `0` or `1` in version 1.0.0 and defaults to `1`.
 The value bounds the unified second opportunity: either minimal-context repair or schema
 context escalation, never both. Use `0` to verify the initial patch without a second call.
 
@@ -108,6 +111,48 @@ context escalation, never both. Use `0` to verify the initial patch without a se
 `plan`, `apply`, or `unknown`. It overrides log inference and is included in the model
 context and result document. This is metadata only; it never causes the agent to run
 `terraform apply`.
+
+### Verified Failure Memory and deterministic caches
+
+`--cache-dir` (or `SEMANTIC_TERRAFORM_CACHE_DIR`) configures a bounded local SQLite
+store and enables Verified Failure Memory by default. Use `--no-failure-memory` to keep
+only deterministic provider-schema and schema-slice caching. With no configured cache
+directory, prior CLI behavior is preserved.
+
+The versioned SHA-256 fingerprint covers repository scope, normalized failure and stage,
+resource identity, exact selected HCL/diff context, Terraform version, provider lock-file
+fingerprint when present, a conservative full Terraform-source fingerprint (covering
+provider constraints), context/schema policy versions, and context budgets. Repository copies can
+share memory only when given the same safe `--repository-id`; GitHub Actions uses the
+repository slug. Different repositories, relevant source, lock files, or policy versions
+do not collide.
+
+The v1.0 eligibility policy deliberately limits reuse to `validate`/`plan` failures with
+one unambiguous affected resource block, exact relevant source, an available provider
+configuration (plus the lock-file fingerprint when present), and enabled fresh
+verification. Ambiguous, skipped, or unverified runs stay on the normal pipeline and are
+never stored as verified memory.
+
+Minimal context selection itself is intentionally rebuilt on every run: it is already
+local/fast, supplies the exact fingerprint input, and caching it would add invalidation
+and sensitive-source duplication without a demonstrated benefit. Only bounded structured
+provider schemas and deterministic slices use computation caching.
+
+Entries contain a patch and bounded redacted diagnosis provenance—never raw logs, full
+source, credentials, state, environment variables, or API keys. Rows are strictly
+validated and size/count bounded. Corrupt or unsafe entries fail closed. Cache clearing
+deletes only known database rows:
+
+```bash
+semantic-terraform-agent cache stats --cache-dir /safe/local/cache
+semantic-terraform-agent cache clear --cache-dir /safe/local/cache
+```
+
+Memory remains disabled by default in the reusable workflow, preserving existing
+consumers. When enabled, the workflow uses a repository-ID/provider-lock-scoped GitHub
+Actions cache for the bounded SQLite store. GitHub caches are best-effort and immutable,
+not a permanent database; eviction or key invalidation produces an ordinary cold miss.
+The cache is not uploaded in the public diagnosis artifact.
 
 ## OpenRouter and provider architecture
 
@@ -818,6 +863,23 @@ Without `--allow-paid-models`, live evaluation rejects any model ID not ending i
 The routed experiment uses one provider, one fixed pair, and independent runs per case; it
 does not use `openrouter/free` because the underlying model may vary.
 
+## v1.0 cold/warm cache benchmark
+
+The v1.0 reporter compares cold and warm results for the same three benchmark cases and
+emits JSON, JSONL, and Markdown without inventing absent provider telemetry:
+
+```bash
+python3 scripts/compare_cache_memory.py \
+  --cold-results evaluation-results/v1.0-cache-memory/raw-results/cold \
+  --warm-results evaluation-results/v1.0-cache-memory/raw-results/warm
+```
+
+For live comparison, run each case once into the cold directory and immediately again
+with the same `--cache-dir`, `--repository-id`, checkout, failure, diff, provider, and
+fixed model into the warm directory. Then run the reporter. A trustworthy warm hit has
+`resolution_source=verified_failure_memory`, fresh verified status, zero current-run LLM
+calls/tokens/cost, and separately labeled historical avoided usage.
+
 ## Running against the existing benchmark repository
 
 From this repository's directory, with Terraform installed and `OPENROUTER_API_KEY`
@@ -947,8 +1009,9 @@ semantic-terraform-agent:
     AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
 ```
 
-For production use, pin `uses:` to a reviewed release tag or commit SHA instead of a
-mutable branch. A complete validate/plan/log-upload example is available at
+After the release is published, production consumers should pin
+`JalinaH/semantic-terraform-agent/.github/workflows/terraform-agent.yml@v1.0.0` (or a
+reviewed commit SHA) instead of a mutable branch. A complete validate/plan/log-upload example is available at
 [`examples/github-actions/consumer.yml`](examples/github-actions/consumer.yml).
 To use fixed OpenRouter routing, set `provider: openrouter`, set an explicit `model`, and
 pass `OPENROUTER_API_KEY` instead of `GEMINI_API_KEY`. For auto routing, additionally set
@@ -1032,9 +1095,24 @@ always required.
 
 ## Recommended next phase
 
-Start v0.10 with a conservative semantic-failure cache and verified-failure memory keyed
-by normalized failure signature, affected resource identity, exact relevant HCL, provider
-schema/version identity, and policy versions. Cache hits must never bypass isolated patch
-verification, and only verified outcomes should be reusable. Keep invalidation,
-provenance, security boundaries, and measurable hit/verification rates explicit.
-LLMLingua, billing, dashboard charts, and hard budgets remain deferred.
+Freeze major agent features after v1.0 and move to hosted-dashboard integration,
+end-to-end benchmark execution, deployment, and presentation work. Semantic similarity,
+LLMLingua, billing, dashboard charts, and hard budgets remain deferred experiments.
+
+## Release readiness
+
+The source distribution and wheel are defined by `pyproject.toml`; evaluation outputs,
+local SQLite cache files, Terraform state/workspaces, `.env`, and build artifacts are
+ignored. No publishing automation or external repository change is introduced. After
+reviewing the working tree and creating any desired GitHub Release assets, the maintainer
+can publish the prepared release with:
+
+```bash
+git tag -a v1.0.0 -m "Semantic Terraform Agent v1.0.0"
+git push origin v1.0.0
+```
+
+The agent never runs `terraform apply`, `terraform destroy`, `terraform import`, or
+`terraform taint`; never auto-merges or auto-commits; and never modifies the original
+checkout. Remembered and model-generated patches are advisory and are applied only in
+fresh isolated temporary verification workspaces.

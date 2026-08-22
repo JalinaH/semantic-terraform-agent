@@ -7,6 +7,26 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Literal, Protocol
 
+from pydantic import TypeAdapter, ValidationError
+
+from semantic_terraform_agent import __version__
+from semantic_terraform_agent.cache import (
+    VERIFIED_FAILURE_FINGERPRINT_VERSION,
+    FailureMemoryPolicy,
+    LocalCacheStore,
+    build_failure_fingerprint,
+    derive_repository_scope,
+)
+from semantic_terraform_agent.cache.fingerprint import (
+    PROVIDER_SCHEMA_CACHE_VERSION,
+    SCHEMA_SLICE_CACHE_VERSION,
+    canonical_hash,
+    provider_lock_fingerprint,
+    schema_cache_key,
+    schema_slice_cache_key,
+)
+from semantic_terraform_agent.cache.models import VerifiedFailureEntry
+from semantic_terraform_agent.cache.store import CacheStoreError
 from semantic_terraform_agent.collectors.failure_log import collect_failure_log
 from semantic_terraform_agent.collectors.git_diff import collect_diff
 from semantic_terraform_agent.collectors.repository import (
@@ -32,6 +52,8 @@ from semantic_terraform_agent.context.builder import (
 )
 from semantic_terraform_agent.context.legacy import legacy_relevant_sources
 from semantic_terraform_agent.models import (
+    CacheComponentTelemetry,
+    CacheTelemetry,
     ContextLevel,
     ContextProgression,
     Diagnosis,
@@ -39,18 +61,23 @@ from semantic_terraform_agent.models import (
     DiagnosisRequest,
     EscalationDecision,
     FailureStage,
+    FailureMemoryTelemetry,
     FinalVerificationStatus,
     LLMCallType,
     LLMInvocation,
     LLMProviderName,
+    LLMUsage,
     ModelProgression,
     ModelRoutingMode,
     ModelTier,
     RepairRequest,
     RepositoryInfo,
     ResultDocument,
+    SchemaOptimization,
+    SchemaSlice,
     SecondAttemptReason,
     TerraformInfo,
+    TokenUsage,
     VerificationAttempt,
     VerificationCommands,
     VerificationErrorRelation,
@@ -71,9 +98,13 @@ from semantic_terraform_agent.reasoning.usage import (
     invocation_from_response,
     legacy_token_usage,
 )
+from semantic_terraform_agent.security import redact_secrets
 from semantic_terraform_agent.terraform.discovery import select_context_mode
 from semantic_terraform_agent.terraform.resources import detect_resources
-from semantic_terraform_agent.terraform.schema import inspect_schemas
+from semantic_terraform_agent.terraform.schema import (
+    inspect_schemas,
+    inspect_terraform_version,
+)
 from semantic_terraform_agent.terraform.verification import (
     skipped_verification,
     verify_candidate_patch,
@@ -123,6 +154,23 @@ def _candidate(diagnosis) -> DiagnosisCandidate:
         suggested_patch=diagnosis.suggested_patch,
         model_confidence=diagnosis.confidence,
         evidence=diagnosis.evidence,
+    )
+
+
+def _redacted_candidate(candidate: DiagnosisCandidate) -> DiagnosisCandidate:
+    """Persist bounded diagnosis provenance without secret-shaped values."""
+    return candidate.model_copy(
+        update={
+            "root_cause": redact_secrets(candidate.root_cause),
+            "violated_constraint": redact_secrets(candidate.violated_constraint),
+            "affected_resources": [
+                redact_secrets(item) for item in candidate.affected_resources
+            ],
+            "evidence": [
+                item.model_copy(update={"detail": redact_secrets(item.detail)})
+                for item in candidate.evidence
+            ],
+        }
     )
 
 
@@ -233,9 +281,13 @@ def diagnose_repository(
         "deterministic-minimal-v1", "legacy-v0.5"
     ] = "deterministic-minimal-v1",
     schema_strategy: Literal["sliced", "full"] = "sliced",
+    cache_dir: Path | None = None,
+    failure_memory_enabled: bool = False,
+    repository_id: str | None = None,
+    cache_store: LocalCacheStore | None = None,
 ) -> ResultDocument:
     if max_repair_attempts not in (0, 1):
-        raise InputError("max_repair_attempts must be 0 or 1 in version 0.9.0")
+        raise InputError("max_repair_attempts must be 0 or 1 in version 1.0.0")
     selected_provider = parse_provider_name(provider_name)
     total_start = time.perf_counter()
     timing: dict[str, float] = {
@@ -250,6 +302,9 @@ def diagnose_repository(
         "initial_model_routing_seconds": 0.0,
         "second_model_routing_seconds": 0.0,
         "model_routing_seconds": 0.0,
+        "failure_memory_lookup_seconds": 0.0,
+        "failure_memory_write_seconds": 0.0,
+        "cache_lookup_seconds": 0.0,
     }
     warnings: list[str] = []
 
@@ -258,20 +313,6 @@ def diagnose_repository(
         tier_ceiling = ModelTier(max_model_tier)
     except ValueError as exc:
         raise InputError("invalid model routing mode or maximum model tier") from exc
-    started = time.perf_counter()
-    routing_registry = model_registry or ModelRegistry.configured(model_registry_path)
-    routing_policy = ModelRoutingPolicy(routing_registry)
-    initial_routing = routing_policy.select_initial(
-        provider=selected_provider,
-        routing_mode=routing_mode,
-        requested_model=model,
-        max_allowed_tier=tier_ceiling,
-    )
-    routing_policy.assert_allowed(initial_routing)
-    timing["initial_model_routing_seconds"] = _elapsed(started)
-    timing["model_routing_seconds"] = timing["initial_model_routing_seconds"]
-    selected_model = initial_routing.selected_model
-
     started = time.perf_counter()
     layout = discover_repository(repo_path, terraform_dir)
     diff = collect_diff(layout, diff_file)
@@ -326,6 +367,222 @@ def diagnose_repository(
     timing["context_build_seconds"] = context_build_seconds
     resource_types = _resource_types(diagnosis_context, resources)
 
+    active_cache = cache_store
+    if active_cache is None and cache_dir is not None:
+        try:
+            active_cache = LocalCacheStore(cache_dir, repository_root=layout.root)
+        except (CacheStoreError, ValueError, OSError) as exc:
+            warnings.append(f"Local cache is unavailable: {exc}")
+    memory_telemetry = FailureMemoryTelemetry(
+        status=(
+            "disabled"
+            if not failure_memory_enabled
+            else ("read_error" if active_cache is None else "ineligible")
+        ),
+        format_version=VERIFIED_FAILURE_FINGERPRINT_VERSION,
+    )
+    schema_cache_telemetry = CacheComponentTelemetry(
+        status="not_requested",
+        format_version=PROVIDER_SCHEMA_CACHE_VERSION,
+    )
+    slice_cache_telemetry = CacheComponentTelemetry(
+        status="not_requested",
+        format_version=SCHEMA_SLICE_CACHE_VERSION,
+    )
+    cache_telemetry = CacheTelemetry(
+        failure_memory=memory_telemetry,
+        provider_schema=schema_cache_telemetry,
+        schema_slice=slice_cache_telemetry,
+    )
+    terraform_version_hint = (
+        inspect_terraform_version(layout) if active_cache is not None else None
+    )
+    lock_fingerprint = provider_lock_fingerprint(layout.terraform_root)
+    failure_fingerprint = None
+    memory_policy = FailureMemoryPolicy()
+    verifier = patch_verifier or verify_candidate_patch
+    if failure_memory_enabled and active_cache is not None:
+        if memory_policy.eligible_for_lookup(
+            diagnosis_context,
+            verification_enabled=verification_enabled,
+        ):
+            assert diagnosis_context is not None
+            repository_scope = derive_repository_scope(layout.root, repository_id)
+            failure_fingerprint = build_failure_fingerprint(
+                failure=failure,
+                context=diagnosis_context,
+                repository_scope=repository_scope,
+                terraform_version=terraform_version_hint,
+                provider_lock_fingerprint=lock_fingerprint,
+                terraform_source_fingerprint=canonical_hash(all_sources),
+            )
+            lookup_started = time.perf_counter()
+            try:
+                memory_entry = active_cache.get_failure(failure_fingerprint.value)
+                lookup_seconds = _elapsed(lookup_started)
+                timing["failure_memory_lookup_seconds"] = lookup_seconds
+                timing["cache_lookup_seconds"] = lookup_seconds
+                memory_telemetry = memory_telemetry.model_copy(
+                    update={
+                        "status": "hit" if memory_entry else "miss",
+                        "fingerprint": failure_fingerprint.value,
+                        "lookup_seconds": lookup_seconds,
+                    }
+                )
+            except CacheStoreError as exc:
+                memory_entry = None
+                lookup_seconds = _elapsed(lookup_started)
+                timing["failure_memory_lookup_seconds"] = lookup_seconds
+                timing["cache_lookup_seconds"] = lookup_seconds
+                memory_telemetry = memory_telemetry.model_copy(
+                    update={
+                        "status": "read_error",
+                        "fingerprint": failure_fingerprint.value,
+                        "lookup_seconds": lookup_seconds,
+                    }
+                )
+                warnings.append(f"Verified failure memory lookup was skipped: {exc}")
+            if memory_entry is not None:
+                verification_started = time.perf_counter()
+                try:
+                    reuse_attempt = verifier(
+                        memory_entry.candidate_patch, layout, attempt=1
+                    )
+                except Exception as exc:
+                    reuse_attempt = _unavailable_attempt(
+                        memory_entry.candidate_patch, 1, exc
+                    )
+                reuse_attempt = reuse_attempt.model_copy(
+                    update={"candidate_source": "verified_failure_memory"}
+                )
+                timing["initial_verification_seconds"] = _elapsed(
+                    verification_started
+                )
+                timing["verification_seconds"] = timing[
+                    "initial_verification_seconds"
+                ]
+                if reuse_attempt.status == "verified":
+                    memory_telemetry = memory_telemetry.model_copy(
+                        update={
+                            "status": "hit_verified",
+                            "reused": True,
+                            "fresh_verification_passed": True,
+                            "reuse_attempt": reuse_attempt,
+                            "llm_calls_avoided": 1,
+                            "historical_input_tokens_avoided": memory_entry.historical_input_tokens,
+                            "historical_total_tokens_avoided": memory_entry.historical_total_tokens,
+                            "historical_cost_avoided_usd": memory_entry.historical_cost_usd,
+                        }
+                    )
+                    cache_telemetry = cache_telemetry.model_copy(
+                        update={"failure_memory": memory_telemetry}
+                    )
+                    timing["cache_read_seconds"] = memory_telemetry.lookup_seconds
+                    timing["cache_write_seconds"] = 0.0
+                    diagnosis = Diagnosis(
+                        initial=memory_entry.diagnosis,
+                        attempts=[reuse_attempt],
+                        final_patch=reuse_attempt.patch,
+                        verification_status="verified_first_attempt",
+                        model_confidence=memory_entry.diagnosis.model_confidence,
+                        evidence_score=memory_entry.evidence_score,
+                        verification=_verification_signal(
+                            "verified_first_attempt", reuse_attempt
+                        ),
+                    )
+                    timing["total_seconds"] = _elapsed(total_start)
+                    zero_usage = LLMUsage(
+                        call_count=0,
+                        input_tokens=0,
+                        output_tokens=0,
+                        total_tokens=0,
+                        cost_usd=0.0,
+                        latency_ms=0,
+                    )
+                    progression = ContextProgression(
+                        strategy=(
+                            "minimal_then_schema_v1"
+                            if context_mode == "auto"
+                            else (
+                                "explicit_schema"
+                                if context_mode == "schema-aware"
+                                else "explicit_lightweight"
+                            )
+                        ),
+                        progressive_enabled=context_mode == "auto",
+                        initial_level=ContextLevel.MINIMAL,
+                        final_level=ContextLevel.MINIMAL,
+                        levels_used=[ContextLevel.MINIMAL],
+                        escalated=False,
+                        reason_code="verification_passed",
+                        reason=(
+                            "An exact repository-scoped verified-memory candidate "
+                            "passed fresh isolated verification."
+                        ),
+                        schema_retrieval_attempted=False,
+                        schema_retrieved=False,
+                        schema_avoided=True if context_mode == "auto" else None,
+                        initial_input_tokens=0,
+                        total_input_tokens=0,
+                    )
+                    return ResultDocument(
+                        status="ok",
+                        repository=RepositoryInfo(
+                            root=str(layout.root),
+                            terraform_dir=layout.terraform_dir,
+                            terraform_files=list(layout.terraform_files),
+                            changed_terraform_files=list(diff.changed_files),
+                            diff_source=diff.source,
+                            diff_comparison=diff.comparison,
+                        ),
+                        terraform=TerraformInfo(
+                            version=terraform_version_hint,
+                            schema_extraction_status="not-requested",
+                            schemas=[],
+                        ),
+                        failure=failure,
+                        context=context,
+                        diagnosis=diagnosis,
+                        timing=timing,
+                        token_usage=TokenUsage(
+                            input_tokens=0, output_tokens=0, total_tokens=0
+                        ),
+                        llm_usage=zero_usage,
+                        llm_calls=[],
+                        context_manifest=diagnosis_context.manifest,
+                        context_optimization=diagnosis_context.optimization,
+                        context_progression=progression,
+                        model_progression=None,
+                        resolution_source="verified_failure_memory",
+                        cache=cache_telemetry,
+                        warnings=warnings,
+                    )
+                memory_telemetry = memory_telemetry.model_copy(
+                    update={
+                        "status": "hit_stale",
+                        "fresh_verification_passed": False,
+                        "reuse_attempt": reuse_attempt,
+                    }
+                )
+                try:
+                    active_cache.record_rejection(
+                        failure_fingerprint.value,
+                        reuse_attempt.status,
+                    )
+                except CacheStoreError as exc:
+                    warnings.append(f"Memory rejection telemetry was not stored: {exc}")
+                warnings.append(
+                    "A verified-memory candidate did not pass fresh verification; "
+                    "normal diagnosis retained its full two-call budget."
+                )
+        else:
+            memory_telemetry = memory_telemetry.model_copy(
+                update={"status": "ineligible"}
+            )
+    cache_telemetry = cache_telemetry.model_copy(
+        update={"failure_memory": memory_telemetry}
+    )
+
     terraform_info = _empty_terraform_info()
     schema_slices = []
     schema_optimization = None
@@ -338,21 +595,149 @@ def diagnose_repository(
         nonlocal schema_optimization
         nonlocal schema_retrieval_attempted
         nonlocal schema_retrieved
+        nonlocal schema_cache_telemetry
+        nonlocal slice_cache_telemetry
         schema_retrieval_attempted = True
         retrieval_started = time.perf_counter()
-        terraform_info, schema_warnings = inspect_schemas(
-            layout, resource_types, enabled=True
+        schema_warnings: list[str] = []
+        schema_key = schema_cache_key(
+            terraform_version=terraform_version_hint,
+            provider_lock_hash=lock_fingerprint,
+            source_fingerprint=canonical_hash(all_sources),
+            resource_types=resource_types,
         )
+        cached_schema = None
+        if active_cache is not None:
+            try:
+                cached_schema = active_cache.get_artifact("provider_schema", schema_key)
+                if cached_schema is not None:
+                    terraform_info = TerraformInfo.model_validate(cached_schema)
+                    if terraform_info.schema_extraction_status != "ok":
+                        raise ValueError("cached provider schema is incomplete")
+                schema_cache_telemetry = schema_cache_telemetry.model_copy(
+                    update={
+                        "status": "hit" if cached_schema is not None else "miss",
+                        "lookup_seconds": _elapsed(retrieval_started),
+                    }
+                )
+            except (CacheStoreError, ValidationError, ValueError) as exc:
+                cached_schema = None
+                schema_cache_telemetry = schema_cache_telemetry.model_copy(
+                    update={
+                        "status": "read_error",
+                        "lookup_seconds": _elapsed(retrieval_started),
+                    }
+                )
+                warnings.append(f"Provider schema cache was ignored: {exc}")
+        if cached_schema is None:
+            terraform_info, schema_warnings = inspect_schemas(
+                layout, resource_types, enabled=True
+            )
+            if (
+                active_cache is not None
+                and terraform_info.schema_extraction_status == "ok"
+            ):
+                write_started = time.perf_counter()
+                try:
+                    active_cache.put_artifact(
+                        "provider_schema",
+                        schema_key,
+                        terraform_info.model_dump(mode="json"),
+                    )
+                    schema_cache_telemetry = schema_cache_telemetry.model_copy(
+                        update={
+                            "write_status": "stored",
+                            "write_seconds": _elapsed(write_started),
+                        }
+                    )
+                except CacheStoreError as exc:
+                    schema_cache_telemetry = schema_cache_telemetry.model_copy(
+                        update={
+                            "status": "write_error",
+                            "write_status": "write_error",
+                            "write_seconds": _elapsed(write_started),
+                        }
+                    )
+                    warnings.append(f"Provider schema cache write was skipped: {exc}")
         timing["schema_retrieval_seconds"] = _elapsed(retrieval_started)
         timing["schema_seconds"] = timing["schema_retrieval_seconds"]
         warnings.extend(schema_warnings)
         slicing_started = time.perf_counter()
-        schema_slices, schema_optimization = slice_schema_records(
-            terraform_info.schemas,
-            failure=failure,
-            diagnosis_context=diagnosis_context,
-            strategy=schema_strategy,
-        )
+        slice_payload = None
+        slice_key = None
+        if active_cache is not None and diagnosis_context is not None:
+            slice_key = schema_slice_cache_key(
+                schemas=[item.model_dump(mode="json") for item in terraform_info.schemas],
+                failure=failure,
+                context=diagnosis_context,
+                strategy=schema_strategy,
+            )
+            try:
+                slice_payload = active_cache.get_artifact("schema_slice", slice_key)
+                if slice_payload is not None:
+                    schema_slices = TypeAdapter(list[SchemaSlice]).validate_python(
+                        slice_payload.get("slices", [])
+                    )
+                    raw_optimization = slice_payload.get("optimization")
+                    schema_optimization = (
+                        SchemaOptimization.model_validate(raw_optimization)
+                        if raw_optimization is not None
+                        else None
+                    )
+                slice_cache_telemetry = slice_cache_telemetry.model_copy(
+                    update={
+                        "status": "hit" if slice_payload is not None else "miss",
+                        "lookup_seconds": _elapsed(slicing_started),
+                    }
+                )
+            except (CacheStoreError, ValidationError, ValueError, TypeError) as exc:
+                slice_payload = None
+                slice_cache_telemetry = slice_cache_telemetry.model_copy(
+                    update={
+                        "status": "read_error",
+                        "lookup_seconds": _elapsed(slicing_started),
+                    }
+                )
+                warnings.append(f"Schema-slice cache was ignored: {exc}")
+        if slice_payload is None:
+            schema_slices, schema_optimization = slice_schema_records(
+                terraform_info.schemas,
+                failure=failure,
+                diagnosis_context=diagnosis_context,
+                strategy=schema_strategy,
+            )
+            if active_cache is not None and slice_key is not None and schema_slices:
+                write_started = time.perf_counter()
+                try:
+                    active_cache.put_artifact(
+                        "schema_slice",
+                        slice_key,
+                        {
+                            "slices": [
+                                item.model_dump(mode="json") for item in schema_slices
+                            ],
+                            "optimization": (
+                                schema_optimization.model_dump(mode="json")
+                                if schema_optimization is not None
+                                else None
+                            ),
+                        },
+                    )
+                    slice_cache_telemetry = slice_cache_telemetry.model_copy(
+                        update={
+                            "write_status": "stored",
+                            "write_seconds": _elapsed(write_started),
+                        }
+                    )
+                except CacheStoreError as exc:
+                    slice_cache_telemetry = slice_cache_telemetry.model_copy(
+                        update={
+                            "status": "write_error",
+                            "write_status": "write_error",
+                            "write_seconds": _elapsed(write_started),
+                        }
+                    )
+                    warnings.append(f"Schema-slice cache write was skipped: {exc}")
         timing["schema_slice_seconds"] = _elapsed(slicing_started)
         schema_retrieved = bool(schema_slices)
         warnings.extend(_schema_fallback_warnings(schema_slices, schema_strategy))
@@ -361,6 +746,22 @@ def diagnose_repository(
         retrieve_schema()
     else:
         timing["schema_seconds"] = 0.0
+
+    # Verified Failure Memory must resolve before registry loading, routing, or
+    # provider construction. Only cache misses enter the model policy path.
+    started = time.perf_counter()
+    routing_registry = model_registry or ModelRegistry.configured(model_registry_path)
+    routing_policy = ModelRoutingPolicy(routing_registry)
+    initial_routing = routing_policy.select_initial(
+        provider=selected_provider,
+        routing_mode=routing_mode,
+        requested_model=model,
+        max_allowed_tier=tier_ceiling,
+    )
+    routing_policy.assert_allowed(initial_routing)
+    timing["initial_model_routing_seconds"] = _elapsed(started)
+    timing["model_routing_seconds"] = timing["initial_model_routing_seconds"]
+    selected_model = initial_routing.selected_model
 
     initial_request = DiagnosisRequest(
         failure=failure,
@@ -406,7 +807,6 @@ def diagnose_repository(
     final_model = initial_model
     second_model = None
 
-    verifier = patch_verifier or verify_candidate_patch
     started = time.perf_counter()
     if verification_enabled:
         try:
@@ -599,6 +999,88 @@ def diagnose_repository(
     )
 
     llm_usage = aggregate_usage(llm_calls)
+    if (
+        failure_memory_enabled
+        and active_cache is not None
+        and diagnosis_context is not None
+        and memory_policy.eligible_for_store(
+            diagnosis_context,
+            verification_status=verification_status,
+            patch=diagnosis.final_patch,
+        )
+    ):
+        if failure_fingerprint is None:
+            repository_scope = derive_repository_scope(layout.root, repository_id)
+            failure_fingerprint = build_failure_fingerprint(
+                failure=failure,
+                context=diagnosis_context,
+                repository_scope=repository_scope,
+                terraform_version=terraform_version_hint,
+                provider_lock_fingerprint=lock_fingerprint,
+                terraform_source_fingerprint=canonical_hash(all_sources),
+            )
+        write_started = time.perf_counter()
+        try:
+            stored = active_cache.put_failure(
+                VerifiedFailureEntry(
+                    fingerprint_version=failure_fingerprint.version,
+                    fingerprint=failure_fingerprint.value,
+                    repository_scope=failure_fingerprint.repository_scope,
+                    created_at=VerifiedFailureEntry.timestamp(),
+                    agent_version=__version__,
+                    failure_signature=failure_fingerprint.failure_signature,
+                    failed_stage=failure.stage,
+                    resource_type=resource_types[0] if resource_types else None,
+                    resource_address=failure.resource_address,
+                    terraform_version=terraform_version_hint,
+                    provider_lock_fingerprint=lock_fingerprint,
+                    candidate_patch=diagnosis.final_patch,
+                    diagnosis=_redacted_candidate(
+                        diagnosis.repair
+                        if diagnosis.repair is not None
+                        else diagnosis.initial
+                    ),
+                    evidence_score=diagnosis.evidence_score,
+                    verification_status=verification_status,
+                    historical_input_tokens=(
+                        llm_usage.input_tokens
+                        if llm_usage.token_counts_complete
+                        else None
+                    ),
+                    historical_total_tokens=(
+                        llm_usage.total_tokens
+                        if llm_usage.token_counts_complete
+                        else None
+                    ),
+                    historical_cost_usd=(
+                        llm_usage.cost_usd if llm_usage.cost_complete else None
+                    ),
+                )
+            )
+            write_seconds = _elapsed(write_started)
+            timing["failure_memory_write_seconds"] = write_seconds
+            memory_telemetry = memory_telemetry.model_copy(
+                update={
+                    "write_status": "stored" if stored else "duplicate",
+                    "fingerprint": failure_fingerprint.value,
+                    "write_seconds": write_seconds,
+                }
+            )
+        except CacheStoreError as exc:
+            write_seconds = _elapsed(write_started)
+            timing["failure_memory_write_seconds"] = write_seconds
+            memory_telemetry = memory_telemetry.model_copy(
+                update={
+                    "status": "write_error",
+                    "write_status": "write_error",
+                    "fingerprint": failure_fingerprint.value,
+                    "write_seconds": write_seconds,
+                }
+            )
+            warnings.append(f"Verified failure memory was not stored: {exc}")
+        cache_telemetry = cache_telemetry.model_copy(
+            update={"failure_memory": memory_telemetry}
+        )
     actual_escalation = (
         second_attempt_reason is SecondAttemptReason.CONTEXT_ESCALATION
         and schema_retrieved
@@ -658,6 +1140,18 @@ def diagnose_repository(
         decisions=routing_decisions,
     )
 
+    timing["cache_read_seconds"] = round(
+        memory_telemetry.lookup_seconds
+        + schema_cache_telemetry.lookup_seconds
+        + slice_cache_telemetry.lookup_seconds,
+        6,
+    )
+    timing["cache_write_seconds"] = round(
+        memory_telemetry.write_seconds
+        + schema_cache_telemetry.write_seconds
+        + slice_cache_telemetry.write_seconds,
+        6,
+    )
     timing["total_seconds"] = _elapsed(total_start)
     return ResultDocument(
         status="ok",
@@ -686,5 +1180,11 @@ def diagnose_repository(
         schema_optimization=schema_optimization,
         context_progression=progression,
         model_progression=model_progression,
+        resolution_source="llm",
+        cache=CacheTelemetry(
+            failure_memory=memory_telemetry,
+            provider_schema=schema_cache_telemetry,
+            schema_slice=slice_cache_telemetry,
+        ),
         warnings=warnings,
     )

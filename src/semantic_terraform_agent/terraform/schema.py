@@ -60,6 +60,22 @@ def _provider_versions(lock_file: Path) -> dict[str, str]:
     return versions
 
 
+def inspect_terraform_version(layout: RepositoryLayout) -> str | None:
+    """Read only the local Terraform CLI version without provider initialization."""
+    executable = find_terraform()
+    if executable is None:
+        return None
+    with tempfile.TemporaryDirectory(
+        prefix="semantic-terraform-agent-version-"
+    ) as temporary:
+        home = Path(temporary)
+        return _terraform_version(
+            executable,
+            layout.terraform_root,
+            sanitized_environment(home),
+        )
+
+
 def extract_resource_schemas(
     document: dict, resource_types: list[str], provider_versions: dict[str, str] | None = None
 ) -> list[SchemaRecord]:

@@ -10,6 +10,8 @@ dist/
 build/
 result.json
 evaluation-results/
+.semantic-terraform-cache/
+semantic-terraform-agent-v1.sqlite3*
 .terraform/
 *.tfstate
 *.tfstate.*

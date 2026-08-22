@@ -213,7 +213,7 @@ def test_openrouter_cli_error_is_categorized_without_gemini_fallback(
     assert "must-not-be-used" not in payload
 
 
-def test_auto_routing_error_is_machine_readable_without_provider_call(
+def test_repository_validation_precedes_auto_routing_and_provider_call(
     tmp_path: Path, capsys
 ) -> None:
     registry = tmp_path / "models.json"
@@ -243,7 +243,8 @@ def test_auto_routing_error_is_machine_readable_without_provider_call(
     )
 
     assert exit_code == 2
-    assert '"routing_error_code": "no_eligible_model"' in output.read_text()
+    assert '"routing_error_code": null' in output.read_text()
+    assert "repository path does not exist" in output.read_text()
     assert "OPENROUTER_API_KEY" not in capsys.readouterr().err
 
 

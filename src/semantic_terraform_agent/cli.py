@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from semantic_terraform_agent.config import (
     ProviderError,
     provider_names,
 )
+from semantic_terraform_agent.cache.store import CacheStoreError, LocalCacheStore
 from semantic_terraform_agent.ci import CIRenderContext, render_pr_comment, render_step_summary
 from semantic_terraform_agent.models import ResultDocument
 from semantic_terraform_agent.orchestration.diagnose import diagnose_repository
@@ -95,7 +97,31 @@ def build_parser() -> argparse.ArgumentParser:
             "verification failure (default: 1)"
         ),
     )
+    diagnose.add_argument(
+        "--cache-dir",
+        type=Path,
+        help=(
+            "local SQLite cache directory (or SEMANTIC_TERRAFORM_CACHE_DIR); "
+            "enables verified failure memory by default when configured"
+        ),
+    )
+    diagnose.add_argument(
+        "--failure-memory",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="enable exact verified-failure reuse (requires a cache directory)",
+    )
+    diagnose.add_argument(
+        "--repository-id",
+        help="stable non-secret repository identity used only to scope cache fingerprints",
+    )
     diagnose.add_argument("--output", required=True, type=Path)
+
+    cache = subparsers.add_parser("cache", help="inspect or clear the local cache")
+    cache_commands = cache.add_subparsers(dest="cache_command", required=True)
+    for name in ("stats", "clear"):
+        command = cache_commands.add_parser(name)
+        command.add_argument("--cache-dir", required=True, type=Path)
 
     render = subparsers.add_parser(
         "render-ci", help="render a bounded CI summary or pull-request comment"
@@ -192,6 +218,15 @@ def _print_summary(result: ResultDocument, output: Path) -> None:
             "  Model escalated:   "
             f"{'yes' if model_progression.model_escalated else 'no'}"
         )
+    print("Resolution:")
+    print(f"  Source:            {result.resolution_source or 'not reported'}")
+    if result.cache is not None:
+        memory = result.cache.failure_memory
+        print("Cache:")
+        print(f"  Failure memory:    {memory.status}")
+        print(f"  Provider schema:   {result.cache.provider_schema.status}")
+        print(f"  Schema slice:      {result.cache.schema_slice.status}")
+        print(f"  LLM calls avoided: {memory.llm_calls_avoided}")
     print("Final verification:")
     print(f"  {diagnosis.verification.status.replace('_', ' ').upper()}")
     if diagnosis.verification.reason:
@@ -333,6 +368,21 @@ def _render_ci(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cache_command(args: argparse.Namespace) -> int:
+    store = LocalCacheStore(args.cache_dir)
+    if args.cache_command == "clear":
+        before = store.clear()
+        print(
+            "Cleared local cache rows: "
+            f"{before.get('failure_memory_entries', 0)} failure-memory, "
+            f"{before.get('artifact_entries', 0)} artifacts."
+        )
+        return 0
+    for name, value in sorted(store.stats().items()):
+        print(f"{name}: {value}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -340,6 +390,12 @@ def main(argv: list[str] | None = None) -> int:
         try:
             return _render_ci(args)
         except (OSError, ValidationError, ValueError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 2
+    if args.command == "cache":
+        try:
+            return _cache_command(args)
+        except (CacheStoreError, OSError, ValueError) as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 2
     if args.command != "diagnose":
@@ -359,6 +415,17 @@ def main(argv: list[str] | None = None) -> int:
                 else None
             )
         )
+        configured_cache = args.cache_dir
+        if configured_cache is None:
+            cache_environment = os.environ.get("SEMANTIC_TERRAFORM_CACHE_DIR")
+            configured_cache = Path(cache_environment) if cache_environment else None
+        failure_memory_enabled = (
+            configured_cache is not None
+            if args.failure_memory is None
+            else args.failure_memory
+        )
+        if failure_memory_enabled and configured_cache is None:
+            raise InputError("--failure-memory requires --cache-dir or SEMANTIC_TERRAFORM_CACHE_DIR")
         result = diagnose_repository(
             repo_path=args.repo_path,
             terraform_dir=args.terraform_dir,
@@ -375,6 +442,9 @@ def main(argv: list[str] | None = None) -> int:
             model_routing=args.model_routing,
             max_model_tier=args.max_model_tier,
             model_registry_path=args.model_registry,
+            cache_dir=configured_cache,
+            failure_memory_enabled=failure_memory_enabled,
+            repository_id=args.repository_id,
         )
         _write_result(args.output, result)
     except (AgentError, OSError, ValidationError, ValueError) as exc:

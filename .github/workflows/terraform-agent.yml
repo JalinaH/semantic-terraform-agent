@@ -61,6 +61,11 @@ on:
         required: false
         default: 1
         type: number
+      failure_memory:
+        description: Enable repository-scoped verified failure memory for this runner
+        required: false
+        default: false
+        type: boolean
       aws_region:
         description: AWS region used by Terraform verification
         required: true
@@ -112,6 +117,7 @@ jobs:
       MODEL_REGISTRY_PATH_INPUT: ${{ inputs.model_registry_path }}
       CONTEXT_MODE: ${{ inputs.context_mode }}
       MAX_REPAIR_ATTEMPTS: ${{ inputs.max_repair_attempts }}
+      FAILURE_MEMORY: ${{ inputs.failure_memory }}
       AWS_REGION: ${{ inputs.aws_region }}
       TF_VAR_aws_region: ${{ inputs.aws_region }}
       CHECKOUT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -203,7 +209,7 @@ jobs:
               fi
               ;;
             *)
-              echo "::error::Unsupported provider in version 0.9.0: ${PROVIDER}"
+              echo "::error::Unsupported provider in version 1.0.0: ${PROVIDER}"
               exit 1
               ;;
           esac
@@ -283,6 +289,18 @@ jobs:
             esac
             echo "MODEL_REGISTRY_PATH=${registry_path}" >> "${GITHUB_ENV}"
           fi
+
+      - name: Restore repository-scoped agent cache
+        if: ${{ inputs.failure_memory }}
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.RESULT_DIRECTORY }}/cache
+          key: >-
+            semantic-tf-agent-v1-${{ runner.os }}-${{ github.repository_id }}-${{
+            hashFiles(format('{0}/.terraform.lock.hcl', inputs.terraform_dir)) }}-${{
+            github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            semantic-tf-agent-v1-${{ runner.os }}-${{ github.repository_id }}-${{ hashFiles(format('{0}/.terraform.lock.hcl', inputs.terraform_dir)) }}-
 
       - name: Download Terraform failure artifact
         uses: actions/download-artifact@v7
@@ -410,6 +428,13 @@ jobs:
           fi
           if [[ -n "${DIFF_FILE:-}" ]]; then
             arguments+=(--diff-file "${DIFF_FILE}")
+          fi
+          if [[ "${FAILURE_MEMORY}" == "true" ]]; then
+            arguments+=(
+              --failure-memory
+              --cache-dir "${RESULT_DIRECTORY}/cache"
+              --repository-id "${GITHUB_REPOSITORY}"
+            )
           fi
           semantic-terraform-agent "${arguments[@]}"
 
