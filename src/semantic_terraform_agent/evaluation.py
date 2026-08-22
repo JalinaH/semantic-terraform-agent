@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -20,12 +21,12 @@ from semantic_terraform_agent.context import ContextBuilder
 from semantic_terraform_agent.context.builder import minimal_diff, minimal_sources
 from semantic_terraform_agent.context.legacy import legacy_relevant_sources
 from semantic_terraform_agent.models import (
+    ContextSelection,
     DiagnosisRequest,
     ResultDocument,
     SchemaRecord,
 )
 from semantic_terraform_agent.reasoning.prompts import build_prompt_parts
-from semantic_terraform_agent.terraform.discovery import select_context_mode
 from semantic_terraform_agent.terraform.resources import detect_resources
 
 
@@ -39,6 +40,16 @@ KNOWN_ROOT_CAUSE_TERMS = {
     "ebs-throughput-volume-type-failure": ("throughput", "gp2"),
     "s3-bucket-naming-conflict-failure": ("bucket", "bucket_prefix"),
 }
+_LEGACY_ARGUMENT_SIGNAL = re.compile(
+    r"(?:argument|attribute|field|parameter)\s+[\"'`]?([A-Za-z_][A-Za-z0-9_-]*)|"
+    r"[\"'`]([A-Za-z_][A-Za-z0-9_-]*)[\"'`]\s+(?:is|required|cannot|must|conflicts)",
+    re.IGNORECASE,
+)
+_LEGACY_AMBIGUOUS_SIGNAL = re.compile(
+    r"provider produced|provider validation|invalid configuration|invalid value|"
+    r"failed validation|unexpected state|inconsistent result|unsupported combination",
+    re.IGNORECASE,
+)
 
 
 def build_context_comparison(
@@ -257,7 +268,7 @@ def _load_case(case_dir: Path):
     resources = detect_resources(
         failure, all_sources, diff.changed_files, diff.changed_lines
     )
-    context = select_context_mode("auto", failure, resources)
+    context = _v0_6_auto_context(failure, resources)
     schema = json.loads(
         (case_dir / "resource_schema.json").read_text(encoding="utf-8")
     )
@@ -275,6 +286,29 @@ def _load_case(case_dir: Path):
         )
     ]
     return case, layout, all_sources, diff, failure, resources, context, schemas
+
+
+def _v0_6_auto_context(failure, resources) -> ContextSelection:
+    """Preserve the historical pre-v0.8 policy for comparison fixtures only."""
+    selected = "schema-aware"
+    reason = "Historical v0.6 auto-mode schema selection."
+    combined = f"{failure.summary}\n{failure.detail}"
+    if (
+        len(resources) == 1
+        and resources[0].confidence == "high"
+        and _LEGACY_ARGUMENT_SIGNAL.search(combined)
+        and not (
+            _LEGACY_AMBIGUOUS_SIGNAL.search(combined)
+            and not _LEGACY_ARGUMENT_SIGNAL.search(combined)
+        )
+    ):
+        selected = "lightweight"
+        reason = "Historical v0.6 auto-mode lightweight selection."
+    return ContextSelection(
+        requested_mode="auto",
+        selected_mode=selected,
+        selection_reason=reason,
+    )
 
 
 def _context_mode(case_dir: Path) -> str:

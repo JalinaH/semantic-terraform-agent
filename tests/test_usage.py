@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from semantic_terraform_agent.models import (
+    ContextLevel,
     LLMCallType,
     LLMInvocation,
     LLMProviderName,
@@ -18,6 +19,7 @@ def invocation(
     total_tokens: int | None,
     cost: float | None,
     latency_ms: int,
+    context_level: ContextLevel | None = None,
 ) -> LLMInvocation:
     return LLMInvocation(
         provider=LLMProviderName.OPENROUTER,
@@ -30,6 +32,7 @@ def invocation(
         cost_usd=cost,
         latency_ms=latency_ms,
         call_type=call_type,
+        context_level=context_level,
         prompt_characters=100,
         system_prompt_characters=40,
         user_prompt_characters=60,
@@ -94,6 +97,39 @@ def test_diagnosis_and_repair_usage_is_aggregated() -> None:
     assert usage.total_tokens == 380
     assert usage.cost_usd == 0.003
     assert usage.latency_ms == 1000
+
+
+def test_minimal_to_schema_usage_is_attributed_per_progression_level() -> None:
+    calls = [
+        invocation(
+            LLMCallType.DIAGNOSIS,
+            input_tokens=100,
+            cached_tokens=0,
+            output_tokens=30,
+            reasoning_tokens=0,
+            total_tokens=130,
+            cost=0.0,
+            latency_ms=400,
+            context_level=ContextLevel.MINIMAL,
+        ),
+        invocation(
+            LLMCallType.REPAIR,
+            input_tokens=180,
+            cached_tokens=0,
+            output_tokens=40,
+            reasoning_tokens=0,
+            total_tokens=220,
+            cost=0.0,
+            latency_ms=600,
+            context_level=ContextLevel.SCHEMA,
+        ),
+    ]
+
+    usage = aggregate_usage(calls)
+
+    assert usage.initial_input_tokens == 100
+    assert usage.escalation_input_tokens == 180
+    assert usage.input_tokens == 280
 
 
 def test_incomplete_cost_and_tokens_are_explicit() -> None:

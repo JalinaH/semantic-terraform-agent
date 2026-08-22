@@ -72,7 +72,10 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         choices=(0, 1),
         default=1,
-        help="maximum repair attempts after actionable verification failure (default: 1)",
+        help=(
+            "maximum second model attempts (repair or context escalation) after "
+            "verification failure (default: 1)"
+        ),
     )
     diagnose.add_argument("--output", required=True, type=Path)
 
@@ -140,6 +143,18 @@ def _print_summary(result: ResultDocument, output: Path) -> None:
     print(f"  {first_description}")
     print("Repair attempt:")
     print("  generated" if diagnosis.repair else "  not generated")
+    progression = result.context_progression
+    if progression is not None:
+        print("Progressive context:")
+        print(f"  Initial level:     {progression.initial_level.value}")
+        print(f"  Final level:       {progression.final_level.value}")
+        print(f"  Escalated:         {'yes' if progression.escalated else 'no'}")
+        print(f"  Reason:            {progression.reason_code or 'not reported'}")
+        print(
+            "  Schema retrieved:  "
+            f"{'yes' if progression.schema_retrieved else 'no'}"
+        )
+        print(f"  Second attempt:    {progression.second_attempt_reason.value}")
     print("Final verification:")
     print(f"  {diagnosis.verification.status.replace('_', ' ').upper()}")
     if diagnosis.verification.reason:
@@ -238,7 +253,10 @@ def _print_summary(result: ResultDocument, output: Path) -> None:
             print(f"  Schema fallback:     yes ({reason})")
         else:
             print("  Schema fallback:     no")
-    elif result.context is not None and result.context.selected_mode == "lightweight":
+    elif result.context is not None and result.context.selected_mode in {
+        "lightweight",
+        "progressive",
+    }:
         print("  Provider schema:     not used")
     print(f"Result: {output.expanduser().resolve(strict=False)}")
     if result.warnings:

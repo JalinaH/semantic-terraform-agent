@@ -31,19 +31,18 @@ def test_explicit_schema_aware_context() -> None:
     assert selected.selected_mode == "schema-aware"
 
 
-def test_auto_uses_lightweight_for_named_argument_and_one_confident_resource() -> None:
+def test_auto_starts_progressive_for_named_argument_and_one_confident_resource() -> None:
     failure = parse_failure_log(
         'Error: Invalid argument\nArgument "mode" must be "safe"\nwith example_widget.primary,'
     )
     selected = select_context_mode("auto", failure, [candidate()])
-    assert selected.selected_mode == "lightweight"
+    assert selected.selected_mode == "progressive"
 
 
-def test_auto_uses_schema_for_ambiguous_or_multiple_resources() -> None:
+def test_auto_starts_progressive_for_ambiguous_or_multiple_resources() -> None:
     ambiguous = parse_failure_log("Error: Provider validation failed")
-    assert select_context_mode("auto", ambiguous, [candidate()]).selected_mode == "schema-aware"
+    assert select_context_mode("auto", ambiguous, [candidate()]).selected_mode == "progressive"
     assert (
         select_context_mode("auto", ambiguous, [candidate(), candidate("medium")]).selected_mode
-        == "schema-aware"
+        == "progressive"
     )
-

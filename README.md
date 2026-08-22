@@ -12,13 +12,14 @@ implementation.
 
 ## Status and scope
 
-Version `0.7.0` adds deterministic provider-schema slicing on top of the v0.6 minimal
-Terraform context engine. Schema-aware calls now select exact diagnostic and changed
-fields, preserve relevant nested structure and metadata, and keep complete schemas out of
-model prompts. Critical HCL and selected schema definitions remain exact; no LLM-based
-selection, lossy prompt compression, model escalation, or caching is used. OpenRouter/
-Gemini support, bounded diagnosis and repair, verification, telemetry, and the reusable
-GitHub Actions interface remain compatible:
+Version `0.8.0` adds progressive deterministic context escalation on top of minimal
+Terraform context and provider-schema slicing. Production `auto` mode begins without a
+provider schema, verifies the first candidate, and retrieves a sliced schema only when a
+cheap deterministic classifier identifies missing provider-semantic evidence. Formatting
+failures use the existing minimal-context repair; environment and unsafe-patch failures
+stop. Both attempts use the same provider and requested model, and the hard limit remains
+two model calls. Critical HCL and schema definitions remain exact; there is no LLM-based
+selection, lossy compression, model routing, or caching.
 
 ```text
 repository + failure log
@@ -28,11 +29,10 @@ repository + failure log
   -> affected resource block(s)
   -> direct var/local/data/resource definitions (depth 1)
   -> deterministic context selection
-  -> selective schema inspection (when selected)
-  -> deterministic schema indexing, path selection, and structural pruning
-  -> provider-neutral Gemini or OpenRouter structured diagnosis
+  -> provider-neutral Gemini or OpenRouter structured diagnosis with minimal context
   -> isolated patch application + fmt/init/validate/plan
-  -> at most one evidence-driven repair + fresh verification
+  -> deterministic stop / minimal repair / sliced-schema escalation decision
+  -> at most one same-model second attempt + fresh verification
   -> result JSON + concise terminal and LLM usage summary
   -> optional GitHub Step Summary and idempotent pull-request comment
 ```
@@ -90,14 +90,15 @@ identify a resource.
 
 - `lightweight`: error, relevant Terraform source, and Git diff only.
 - `schema-aware`: adds deterministic slices of matched resource schemas and provider metadata.
-- `auto`: applies the deterministic policy described below.
+- `auto`: starts minimal and applies progressive deterministic escalation after verification.
 
 The default Gemini model is `gemini-2.5-flash`. OpenRouter requires an explicit dynamic
 model ID in `provider/model` form; the agent does not maintain a fixed model allowlist.
 Patch verification is enabled by default. Use `--no-verify-patch` to record a
 deliberately skipped verification in environments where local commands must not run.
-`--max-repair-attempts` accepts only `0` or `1` in version 0.7.0 and defaults to `1`.
-Use `0` to verify the initial patch without asking the model for a repair.
+`--max-repair-attempts` accepts only `0` or `1` in version 0.8.0 and defaults to `1`.
+The value bounds the unified second opportunity: either minimal-context repair or schema
+context escalation, never both. Use `0` to verify the initial patch without a second call.
 
 `--failed-stage` optionally records the caller-known stage as `init`, `fmt`, `validate`,
 `plan`, `apply`, or `unknown`. It overrides log inference and is included in the model
@@ -361,9 +362,9 @@ Soft limits independently bound the diagnostic, diff, affected block, supporting
 and total selected context. Packing drops lower-priority material first. Oversized HCL is
 reduced only at line boundaries around the diagnostic/changed location and marked with a
 stable truncation reason; it is never summarized or rewritten. Schema-aware and auto modes
-use this same minimal Terraform context. When schema-aware mode is selected, the context
-is paired with the deterministic schema slice described below rather than the complete
-resource schema.
+use this same minimal Terraform context. Explicit schema-aware mode pairs it with a
+deterministic schema slice on the first call. Auto mode adds that slice only after an
+eligible failed verification.
 
 ## Selective schema inspection
 
@@ -463,25 +464,44 @@ Attempt statuses are `verified`, `failed`, `rejected`, `unavailable`, and `skipp
 Each command separately records `passed`, `failed`, `error`, or `skipped`, its exit code,
 bounded stdout/stderr, and duration. Verification failure does not discard the diagnosis.
 
-## Bounded repair policy
+## Progressive context and bounded second attempt
 
-An initial failure at `git apply --check`, `fmt`, `validate`, or `plan` contains actionable
-evidence and may trigger one dedicated repair call when `--max-repair-attempts 1` is active.
-Patch-check repair applies only after the patch has already passed structural, path, and
-scope safety validation. The repair prompt is rebuilt from structured minimal fields; it
-does not embed the original user prompt or raw log. It contains the diagnostic, affected
-source, relevant change, direct definitions, original diagnosis/patch, failed stage, only
-that command's bounded/redacted output, and schemas only when the original mode was
-schema-aware. It tells the model to preserve the diagnosis unless the new evidence
-contradicts it.
+`auto` uses `MINIMAL → SCHEMA` progression. The first request contains only the normalized
+diagnostic, selected Terraform blocks, relevant diff, and bounded one-hop definitions; it
+does not inspect or include provider schema. After isolated verification,
+`ContextEscalationPolicy` returns one structured `stop`, `repair`, or `escalate` decision.
+The `EXPANDED` level exists in the data model for future work but is never selected
+automatically in v0.8.
 
-No repair runs for rejected/unsafe patches, structural/path/scope validation failures,
-patch application failures, missing Terraform, unavailable environment/provider
-initialization, explicit verification skip, init failure, malformed model output, or when
-retries are disabled.
-There is no loop or recursion: maximum model invocations are exactly two—one diagnosis and
-at most one repair. The repaired patch is subjected to the full safety checks in a new
-temporary copy.
+Decision precedence is deterministic:
+
+1. verified, rejected/unsafe, skipped, environment, credentials, network, patch-apply, and
+   initialization outcomes stop;
+2. patch-check, formatting, or newly introduced syntax failures use the existing repair
+   with the original context;
+3. a same or new provider-semantic `validate`/`plan` diagnostic, bounded resource
+   ambiguity, or a failure-relevant unresolved symbol may escalate from minimal to sliced
+   schema;
+4. otherwise an actionable failure gets the conservative bounded repair, or stops.
+
+Similarity uses the failed stage, parsed resource address when both diagnostics provide
+one, and normalized non-generic term overlap. Verification relationships are recorded as
+`same_failure`, `new_semantic_failure`, `new_syntactic_failure`,
+`environment_failure`, or `unknown`. Phrase sets for semantic, syntactic, credential, and
+network failures are provider-neutral module constants and covered by tests. The policy
+performs no Terraform command, network request, schema lookup, or model call.
+
+When the action is schema escalation, the existing safe inspector runs once, the v0.7
+slicer selects the relevant paths, and the second prompt combines the original normalized
+diagnostic/minimal source, first diagnosis and patch, failed stage, bounded redacted failed
+command output, escalation reason/signals, and sliced schema. If no usable schema is
+available, the agent stops instead of rerunning an unchanged prompt. Schema retrieval is
+never repeated within a run and has no cross-run cache.
+
+Explicit `lightweight` never escalates and retains one minimal-context repair. Explicit
+`schema-aware` retrieves sliced schema before its first call and retains one schema-aware
+repair. There is no loop: one initial call plus at most one repair or escalation call, with
+the same provider and requested model. A second failed verification always stops.
 
 The diagnosis contract is:
 
@@ -497,7 +517,8 @@ The diagnosis contract is:
   "verification": {
     "passed": true,
     "status": "verified_first_attempt"
-  }
+  },
+  "second_attempt_reason": "none"
 }
 ```
 
@@ -506,13 +527,26 @@ Final statuses are `verified_first_attempt`, `verified_after_retry`,
 `verification_skipped`. `failed_stage` is one of `patch_check`, `patch_apply`, `fmt`,
 `init`, `validate`, or `plan`.
 
-## Automatic context policy
+## Progressive telemetry
 
-`auto` selects lightweight context only when exactly one resource has high-confidence
-evidence and the diagnostic clearly names the invalid/conflicting argument or constraint.
-It selects schema-aware context when resource detection is absent or plural, evidence is
-weaker, or a provider validation diagnostic is ambiguous. The reason is always written to
-`context.selection_reason`. No LLM call is spent choosing the mode.
+For `auto`, `context.selected_mode` is `progressive`. `context_progression` records the
+strategy, initial/final levels, levels used, whether escalation occurred, a stable reason
+code, bounded deterministic signals, error relationship, second-attempt reason, schema
+retrieval/avoidance, and same-model status. Explicit modes produce the same structure with
+`progressive_enabled: false` so hosted consumers do not need separate result shapes.
+
+Each `llm_calls` and `context_telemetry.calls` entry records its `context_level`. Per-call
+context telemetry also records prompt/source/schema characters, source files, resource
+blocks, and selected schema paths. `llm_usage.initial_input_tokens` is the complete first
+request input count; `escalation_input_tokens` is the complete second request count only
+for minimal-to-schema progression, not incremental schema tokens. Provider-reported token
+counts remain authoritative.
+
+Timing includes `initial_context_build_seconds`, `initial_llm_seconds`,
+`initial_verification_seconds`, `escalation_decision_seconds`,
+`schema_retrieval_seconds`, `schema_slice_seconds`, `second_llm_seconds`, and
+`second_verification_seconds`, while existing aggregate timing keys remain available.
+Auto runs also expose `schema_avoided`; explicit modes leave it null.
 
 ## Direct Gemini support
 
@@ -561,12 +595,15 @@ telemetry, minimal repair prompts, context manifests/optimization math, schema
 compatibility, exact and changed schema-field selection, nested structural pruning, required
 siblings, description/path/depth budgets, malformed-schema fallback, schema manifests and
 telemetry, arbitrary-file deferral, schema selection/missing CLI, all context modes,
+minimal-first auto behavior, semantic escalation, formatting repair, environment stopping,
+verification-error relationships, call bounds, schema avoidance, progression telemetry,
+three-strategy evaluation aggregates,
 strict provider JSON, OpenRouter request construction, structured-output fallback,
 categorized errors, bounded transport retries, free/unknown cost handling, secret safety,
 usage aggregation, missing API keys, isolated patch application, plan flags/gating, unsafe
 first and second patches, state and `.terraform` exclusion, output redaction, missing
 Terraform, real Git application, complete attempt history, final status mapping, malformed
-repair, and the exact one-repair bound.
+repair, and the exact one-second-attempt bound.
 
 ## v0.5 versus v0.6 context benchmark
 
@@ -635,6 +672,43 @@ OPENROUTER_API_KEY='...' python3 scripts/compare_schema_context.py \
 
 The live path rejects non-`:free` models and runs the same model once with `full` and once
 with `sliced`; provider-reported tokens/cost and verified patch status remain authoritative.
+
+## v0.8 progressive-context benchmark
+
+The v0.8 harness compares `always_lightweight`, `always_schema`, and `progressive` for the
+DynamoDB, EBS, and S3 diagnostic packages using the same model setting:
+
+```bash
+python3 scripts/compare_progressive_context.py \
+  --benchmark-root ../terraform-failure-benchmarks/diagnostic-packages
+```
+
+It writes `results.json`, `results.jsonl`, and `comparison.md` under the ignored
+`evaluation-results/v0.8-progressive-context/` directory. Offline mode records
+deterministic initial prompt characters, a synthetic schema-escalation prompt character
+measurement, and the always-schema prompt characters. It leaves model calls, tokens,
+cost, latency, escalation, and verification values uncollected rather than estimating
+them. The synthetic prompt is a rendering measurement, not a correctness result.
+
+Existing result directories can be merged with `--always-lightweight-results DIR`,
+`--always-schema-results DIR`, and `--progressive-results DIR`. Aggregates cover minimal
+first-pass verification, schema escalation/avoidance, overall verified fixes, and mean
+tokens/cost/latency from actual live rows only. Per-case token and cost reductions versus
+always-schema are computed only when both results report the same provider and model.
+
+To execute all nine live runs with a fixed free OpenRouter model:
+
+```bash
+OPENROUTER_API_KEY='...' python3 scripts/compare_progressive_context.py \
+  --benchmark-root ../terraform-failure-benchmarks/diagnostic-packages \
+  --live-repository-root ../terraform-failure-benchmarks \
+  --run-live \
+  --model '<provider>/<fixed-model>:free'
+```
+
+Live mode refuses non-`:free` models. Terraform, provider access, benchmark case sources,
+and any required cloud credentials must be available. Provider-reported usage and verified
+patch status are authoritative; free-model nondeterminism remains an evaluation limitation.
 
 ## Running against the existing benchmark repository
 
@@ -845,9 +919,9 @@ always required.
 
 ## Recommended next phase
 
-Start v0.7 with deterministic provider-schema slicing over the already structured
-`DiagnosisContext`: select the failing resource schema attributes named by the diagnostic,
-affected block, and changed expressions, while retaining exact constraints and measuring
-schema-section characters separately. Do not add progressive escalation until v0.8.
-LLMLingua, semantic caching, automatic premium routing, billing, dashboard charts, and
-hard budgets remain explicitly deferred.
+Start v0.9 with a cost-aware model-routing policy layered outside the now-observable
+context progression. Define deterministic model tiers and eligibility, keep the v0.8
+context decision independent, compare models on the same benchmark inputs, and preserve
+the two-call ceiling before considering any cheap-to-strong route. LLMLingua, semantic
+caching, verified-failure memory, billing, dashboard charts, and hard budgets remain
+explicitly deferred.

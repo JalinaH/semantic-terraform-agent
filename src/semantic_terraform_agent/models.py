@@ -22,6 +22,52 @@ class LLMCallType(str, Enum):
     REPAIR = "repair"
 
 
+class ContextLevel(str, Enum):
+    MINIMAL = "minimal"
+    SCHEMA = "schema"
+    EXPANDED = "expanded"
+
+
+class SecondAttemptReason(str, Enum):
+    NONE = "none"
+    REPAIR = "repair"
+    CONTEXT_ESCALATION = "context_escalation"
+
+
+class VerificationErrorRelation(str, Enum):
+    SAME_FAILURE = "same_failure"
+    NEW_SEMANTIC_FAILURE = "new_semantic_failure"
+    NEW_SYNTACTIC_FAILURE = "new_syntactic_failure"
+    ENVIRONMENT_FAILURE = "environment_failure"
+    UNKNOWN = "unknown"
+
+
+EscalationReasonCode: TypeAlias = Literal[
+    "verification_passed",
+    "provider_constraint_unresolved",
+    "ambiguous_resource",
+    "unresolved_schema_identifier",
+    "verification_semantic_failure",
+    "multiple_candidate_resources",
+    "unresolved_supporting_symbol",
+    "minimal_patch_failed_semantically",
+    "insufficient_evidence",
+    "formatting_failure",
+    "syntactic_patch_failure",
+    "patch_check_failure",
+    "patch_apply_failure",
+    "unsafe_patch",
+    "environment_unavailable",
+    "credentials_unavailable",
+    "provider_network_failure",
+    "verification_skipped",
+    "explicit_mode_repair",
+    "second_attempt_disabled",
+    "schema_unavailable",
+    "no_actionable_failure",
+]
+
+
 class ProviderFailureCategory(str, Enum):
     MODEL_NOT_FOUND = "model_not_found"
     MODEL_UNAVAILABLE = "model_unavailable"
@@ -88,7 +134,7 @@ class TerraformInfo(StrictModel):
 
 class ContextSelection(StrictModel):
     requested_mode: Literal["lightweight", "schema-aware", "auto"]
-    selected_mode: Literal["lightweight", "schema-aware"]
+    selected_mode: Literal["lightweight", "schema-aware", "progressive"]
     selection_reason: str
 
 
@@ -230,6 +276,44 @@ class SchemaOptimization(StrictModel):
     repair_expanded: bool = False
 
 
+class EscalationDecision(StrictModel):
+    action: Literal["stop", "repair", "escalate"]
+    should_escalate: bool
+    should_repair: bool
+    from_level: ContextLevel
+    to_level: ContextLevel | None = None
+    reason_code: EscalationReasonCode
+    reason: str
+    signals: list[str] = Field(default_factory=list, max_length=8)
+    verification_error_relation: VerificationErrorRelation
+
+
+class ContextProgression(StrictModel):
+    strategy: Literal[
+        "minimal_then_schema_v1",
+        "explicit_lightweight",
+        "explicit_schema",
+    ]
+    progressive_enabled: bool
+    initial_level: ContextLevel
+    final_level: ContextLevel
+    levels_used: list[ContextLevel]
+    escalated: bool
+    escalation_count: int = Field(default=0, ge=0, le=1)
+    reason_code: EscalationReasonCode | None = None
+    reason: str | None = None
+    signals: list[str] = Field(default_factory=list, max_length=8)
+    verification_error_relation: VerificationErrorRelation | None = None
+    second_attempt_reason: SecondAttemptReason = SecondAttemptReason.NONE
+    schema_retrieval_attempted: bool = False
+    schema_retrieved: bool = False
+    schema_avoided: bool | None = None
+    same_model: bool = True
+    initial_input_tokens: int | None = Field(default=None, ge=0)
+    escalation_input_tokens: int | None = Field(default=None, ge=0)
+    total_input_tokens: int | None = Field(default=None, ge=0)
+
+
 class EvidenceItem(StrictModel):
     source: Literal["terraform_error", "terraform_source", "git_diff", "provider_schema"]
     detail: str
@@ -315,6 +399,7 @@ class Diagnosis(StrictModel):
     model_confidence: float
     evidence_score: float
     verification: VerificationSignal
+    second_attempt_reason: SecondAttemptReason = SecondAttemptReason.NONE
 
 
 class TokenUsage(StrictModel):
@@ -337,6 +422,7 @@ class LLMInvocation(StrictModel):
     latency_ms: int = Field(ge=0)
     cache_hit: bool | None = None
     call_type: LLMCallType
+    context_level: ContextLevel | None = None
     prompt_characters: int = Field(ge=0)
     system_prompt_characters: int = Field(ge=0)
     user_prompt_characters: int = Field(ge=0)
@@ -354,10 +440,12 @@ class LLMUsage(StrictModel):
     latency_ms: int | None = Field(default=None, ge=0)
     token_counts_complete: bool = True
     cost_complete: bool = True
+    initial_input_tokens: int | None = Field(default=None, ge=0)
+    escalation_input_tokens: int | None = Field(default=None, ge=0)
 
 
 class ContextTelemetry(StrictModel):
-    mode: Literal["lightweight", "schema-aware"]
+    mode: Literal["lightweight", "schema-aware", "progressive"]
     prompt_characters: int = Field(ge=0)
     system_prompt_characters: int = Field(ge=0)
     user_prompt_characters: int = Field(ge=0)
@@ -383,10 +471,16 @@ class ContextSectionTelemetry(StrictModel):
 
 class ContextCallTelemetry(StrictModel):
     call_type: LLMCallType
+    context_level: ContextLevel | None = None
     prompt_characters: int = Field(ge=0)
     system_prompt_characters: int = Field(ge=0)
     user_prompt_characters: int = Field(ge=0)
     selected_context_characters: int | None = Field(default=None, ge=0)
+    selected_source_characters: int | None = Field(default=None, ge=0)
+    schema_characters: int = Field(default=0, ge=0)
+    source_file_count: int = Field(default=0, ge=0)
+    resource_count: int = Field(default=0, ge=0)
+    schema_path_count: int = Field(default=0, ge=0)
     sections: dict[str, ContextSectionTelemetry] = Field(default_factory=dict)
 
 
@@ -402,12 +496,15 @@ class DiagnosisRequest(StrictModel):
     schema_slices: list[SchemaSlice] = Field(default_factory=list)
     schema_optimization: SchemaOptimization | None = None
     schema_strategy: Literal["sliced", "full"] = "sliced"
+    context_level: ContextLevel | None = None
 
 
 class RepairRequest(StrictModel):
     original: DiagnosisRequest
     previous_diagnosis: ModelDiagnosis
     failed_attempt: VerificationAttempt
+    second_attempt_reason: SecondAttemptReason = SecondAttemptReason.REPAIR
+    escalation_decision: EscalationDecision | None = None
 
 
 class ProviderResponse(StrictModel):
@@ -432,6 +529,7 @@ class ResultDocument(StrictModel):
     context_optimization: ContextOptimization | None = None
     schema_slice_manifest: list[SchemaSliceManifest] = Field(default_factory=list)
     schema_optimization: SchemaOptimization | None = None
+    context_progression: ContextProgression | None = None
     warnings: list[str] = Field(default_factory=list)
     error: str | None = None
     error_code: ProviderFailureCategory | None = None

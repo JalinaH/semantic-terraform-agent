@@ -27,11 +27,14 @@ _SECTION_NAMES = (
     "original_diagnosis",
     "original_patch",
     "verification_evidence",
+    "escalation_evidence",
 )
 
 
 def _schema_context(request: DiagnosisRequest) -> list[dict]:
-    if request.context.selected_mode != "schema-aware":
+    if request.context.selected_mode == "lightweight":
+        return []
+    if request.context.selected_mode == "progressive" and not request.schema_slices:
         return []
     if request.schema_strategy == "sliced" and request.schema_slices:
         return [
@@ -133,19 +136,26 @@ def build_repair_prompt_parts(request: RepairRequest) -> PromptParts:
             "ORIGINAL CANDIDATE PATCH\n" + request.previous_diagnosis.suggested_patch
         ),
         "verification_evidence": _render_verification_evidence(request),
+        "escalation_evidence": _render_escalation_evidence(request),
         "metadata": _render_metadata(request.original),
         "provider_schema": _render_schema(request.original),
     }
-    system = """The previous candidate patch did not pass Terraform verification. Produce
-one revised patch that addresses the verification evidence while preserving the intended
-root-cause fix.
+    if request.second_attempt_reason.value == "context_escalation":
+        opening = """The first candidate did not pass Terraform verification. Additional
+deterministically selected provider-schema context is now available. Revise the diagnosis
+and produce one final candidate patch that addresses the verification evidence."""
+    else:
+        opening = """The previous candidate patch did not pass Terraform verification.
+Produce one revised patch that addresses the verification evidence while preserving the
+intended root-cause fix."""
+    system = f"""{opening}
 
 Use only the evidence supplied below. Preserve the original diagnosis unless verification
 directly contradicts it. Return a complete diagnosis using the same strict JSON response
 schema, with a minimal unified diff in suggested_patch. Critical Terraform source and diff
 lines are exact excerpts. Use the exact repository-relative paths shown below, with `a/`
 and `b/` patch prefixes and exact hunk line counts. Never suggest terraform apply or
-destroy. Only one repair is allowed.
+destroy. Only one bounded second attempt is allowed.
 
 Evidence source must be one of terraform_error, terraform_source, git_diff,
 provider_schema. Confidence remains a model estimate between 0 and 1, not a verification
@@ -242,6 +252,8 @@ def _render_metadata(request: DiagnosisRequest) -> str:
         f"Strategy: {context.optimization.strategy}",
         f"Ambiguous candidates: {'yes' if context.manifest.ambiguous else 'no'}",
     ]
+    if request.context_level is not None:
+        lines.insert(2, f"Context level: {request.context_level.value}")
     if request.terraform_version:
         lines.append(f"Terraform version: {request.terraform_version}")
     if context.unresolved_symbols:
@@ -281,6 +293,22 @@ def _render_verification_evidence(request: RepairRequest) -> str:
     return "\n".join(lines)
 
 
+def _render_escalation_evidence(request: RepairRequest) -> str:
+    decision = request.escalation_decision
+    if decision is None or request.second_attempt_reason.value != "context_escalation":
+        return ""
+    lines = [
+        "CONTEXT ESCALATION DECISION",
+        f"From: {decision.from_level.value}",
+        f"To: {(decision.to_level.value if decision.to_level else 'none')}",
+        f"Reason code: {decision.reason_code}",
+        f"Reason: {decision.reason}",
+        "Signals:",
+    ]
+    lines.extend(f"- {signal}" for signal in decision.signals)
+    return "\n".join(lines)
+
+
 def _build_legacy_repair_prompt_parts(request: RepairRequest) -> PromptParts:
     original = request.original
     failure = original.failure.model_dump(mode="json", exclude={"original_log"})
@@ -308,6 +336,12 @@ def _build_legacy_repair_prompt_parts(request: RepairRequest) -> PromptParts:
         "failed_verification_stage": request.failed_attempt.failed_stage,
         "failed_command_evidence": failed_evidence,
         "relevant_provider_schemas": _schema_context(original),
+        "second_attempt_reason": request.second_attempt_reason.value,
+        "escalation_decision": (
+            request.escalation_decision.model_dump(mode="json")
+            if request.escalation_decision
+            else None
+        ),
     }
     encoded = redact_secrets(json.dumps(payload, indent=2, sort_keys=True))
     system = """The previous candidate patch did not pass Terraform verification. Produce
@@ -322,7 +356,7 @@ relevant_terraform_source, with `a/` and `b/` prefixes in patch headers. Every h
 header's old/new line counts must exactly match its context, removed, and added lines.
 Never suggest terraform apply or destroy.
 
-Only one repair is allowed. Evidence source must be one of: terraform_error,
+Only one bounded second attempt is allowed. Evidence source must be one of: terraform_error,
 terraform_source, git_diff, provider_schema. Confidence remains a model estimate between
 0 and 1, not a verification result.
 
