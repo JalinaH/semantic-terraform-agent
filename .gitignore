@@ -9,6 +9,7 @@ htmlcov/
 dist/
 build/
 result.json
+evaluation-results/
 .terraform/
 *.tfstate
 *.tfstate.*

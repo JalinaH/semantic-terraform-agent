@@ -41,6 +41,14 @@ class Limits:
     max_prompt_log_chars: int = 20_000
     max_patch_bytes: int = 1024 * 1024
     max_verification_output_chars: int = 8_000
+    max_diagnostic_context_chars: int = 4_000
+    max_relevant_diff_chars: int = 6_000
+    max_resource_block_chars: int = 12_000
+    max_supporting_context_chars: int = 8_000
+    max_total_context_chars: int = 26_000
+    max_context_candidate_blocks: int = 3
+    diff_context_lines: int = 3
+    max_reference_depth: int = 1
     max_command_output_bytes: int = 50 * 1024 * 1024
     command_timeout_seconds: int = 180
 

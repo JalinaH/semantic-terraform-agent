@@ -53,6 +53,7 @@ def test_cli_defaults_to_one_repair_attempt() -> None:
     assert args.failed_stage is None
     assert args.provider == "gemini"
     assert args.model is None
+    assert args.context_strategy == "deterministic-minimal-v1"
 
 
 def test_cli_accepts_openrouter_and_dynamic_free_model() -> None:

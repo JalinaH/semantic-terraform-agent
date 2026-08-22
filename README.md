@@ -12,15 +12,20 @@ implementation.
 
 ## Status and scope
 
-Version `0.5.0` adds OpenRouter and trustworthy per-invocation/aggregate usage telemetry
-while preserving direct Gemini support, bounded diagnosis and repair, plan verification,
-and reusable GitHub Actions integration:
+Version `0.6.0` adds a deterministic minimal-context engine. It substantially reduces
+model input by selecting exact Terraform diagnostics, relevant changes, affected blocks,
+and only direct supporting definitions. Critical HCL is preserved exactly; no LLM-based
+summarization, lossy prompt compression, model escalation, or schema slicing is used.
+OpenRouter/Gemini support, bounded diagnosis and repair, verification, telemetry, and the
+reusable GitHub Actions interface remain compatible:
 
 ```text
 repository + failure log
   -> safe input discovery
-  -> changed Terraform files
-  -> candidate resource blocks
+  -> exact normalized diagnostic
+  -> relevant changed Terraform lines
+  -> affected resource block(s)
+  -> direct var/local/data/resource definitions (depth 1)
   -> deterministic context selection
   -> selective schema inspection (when selected)
   -> provider-neutral Gemini or OpenRouter structured diagnosis
@@ -89,7 +94,7 @@ The default Gemini model is `gemini-2.5-flash`. OpenRouter requires an explicit 
 model ID in `provider/model` form; the agent does not maintain a fixed model allowlist.
 Patch verification is enabled by default. Use `--no-verify-patch` to record a
 deliberately skipped verification in environments where local commands must not run.
-`--max-repair-attempts` accepts only `0` or `1` in version 0.5.0 and defaults to `1`.
+`--max-repair-attempts` accepts only `0` or `1` in version 0.6.0 and defaults to `1`.
 Use `0` to verify the initial patch without asking the model for a repair.
 
 `--failed-stage` optionally records the caller-known stage as `init`, `fmt`, `validate`,
@@ -181,9 +186,21 @@ costs or `null` when no cost was reported. An explicit free-model cost of zero r
 `not reported`. The agent uses provider-reported cost and does not embed a pricing table.
 
 `token_usage` remains for backward compatibility and is derived from the aggregate
-input/output/total counts. `context_telemetry` records selected mode, prompt character
-counts, whether resource schema and Git diff evidence were included, and source-file
-count. These fields establish a v0.5 baseline without implementing context minimization.
+input/output/total counts. `context_telemetry` retains the original fields and adds exact
+pre-call section character counts, selected-context and rendered-user-prompt character
+counts, block/change/reference counts, schema inclusion, and separate diagnosis/repair
+call records. It does not estimate per-section tokens.
+
+`context_manifest` records only identities and counts: included files/resources/symbols,
+referenced/resolved/unresolved symbols, changed-line count, truncation reasons, and
+whether candidate selection was ambiguous. It does not duplicate source. The separate
+`context_optimization` object defines available source as all Terraform source characters
+discoverable in the selected working directory and compares that with exact selected HCL.
+Its token-reduction ratio stays `null` unless a comparable provider-reported baseline is
+available; character reduction is never presented as token reduction.
+`timing.context_build_seconds` measures local selection time. The CLI prints available
+versus included Terraform files/resources and source-character reduction, but makes no
+token-saving claim without a comparison run.
 
 An abbreviated result is:
 
@@ -212,9 +229,38 @@ An abbreviated result is:
   ],
   "context_telemetry": {
     "mode": "lightweight",
+    "prompt_characters": 3100,
     "resource_schema_included": false,
     "git_diff_included": true,
-    "source_file_count": 1
+    "source_file_count": 2,
+    "source_block_count": 2,
+    "changed_line_count": 2,
+    "referenced_symbol_count": 1,
+    "sections": {
+      "terraform_error": {"characters": 280},
+      "git_diff": {"characters": 310},
+      "terraform_source": {"characters": 520},
+      "supporting_context": {"characters": 120},
+      "metadata": {"characters": 95},
+      "provider_schema": {"characters": 0}
+    }
+  },
+  "context_manifest": {
+    "included_files": ["infrastructure/main.tf", "infrastructure/variables.tf"],
+    "included_resources": ["aws_ebs_volume.example"],
+    "included_symbols": ["var.volume_type"],
+    "unresolved_symbols": [],
+    "changed_lines": 2,
+    "truncated_sections": []
+  },
+  "context_optimization": {
+    "strategy": "deterministic_minimal_v1",
+    "available_source_characters": 18200,
+    "selected_source_characters": 3100,
+    "characters_avoided": 15100,
+    "reduction_ratio": 0.82967,
+    "character_reduction_ratio": 0.82967,
+    "input_token_reduction_ratio": null
   }
 }
 ```
@@ -235,7 +281,9 @@ paths that escape the root are rejected. It does not scan unrelated file content
 
 Diff `+++` paths are normalized and intersected with discovered Terraform files.
 Changed line numbers from unified-diff hunks are retained so a change inside a resource
-block is stronger evidence than a change elsewhere in its file.
+block is stronger evidence than a change elsewhere in its file. Prompt context excludes
+non-Terraform changes and unrelated Terraform hunks. Oversized relevant hunks retain exact
+changed lines plus bounded nearby context and are explicitly marked truncated.
 
 ## Failure parsing
 
@@ -250,8 +298,10 @@ format) and newline-delimited JSON diagnostics. It extracts:
 When the caller supplies `--failed-stage`, that explicit value replaces the inferred stage.
 
 Unstructured or malformed logs produce a conservative fallback rather than an invented
-resource. The entire caller-supplied log is preserved in `failure.original_log`; only a
-bounded, redacted excerpt is sent to the selected LLM provider.
+resource. The entire caller-supplied log is preserved in `failure.original_log`, but the
+normal v0.6 prompt sends the bounded normalized diagnostic rather than duplicating the raw
+log. The original log remains in `failure.original_log` for backward compatibility and is
+not copied into context telemetry or the context manifest.
 
 ## Resource detection
 
@@ -266,6 +316,43 @@ matches their braces while ignoring quoted strings and comments. Candidate ranki
 The result may contain zero, one, or several candidates. No provider or resource type is
 hardcoded. Terraform addresses with module prefixes or instance keys retain the address
 from the error while mapping to the underlying resource type for schema lookup.
+
+## Deterministic minimal context
+
+`ContextBuilder` separates source selection from prompt formatting and returns a
+structured `DiagnosisContext`. Production prompts consume that structure; the legacy
+v0.5 formatter is retained only for evaluation comparisons.
+
+Lightweight context is packed in this deterministic priority order:
+
+1. exact Terraform summary, detail, stage, address, and referenced file/line;
+2. the affected Terraform resource block;
+3. relevant changed Terraform lines;
+4. directly referenced variable/local definitions;
+5. direct data/resource declarations when available;
+6. small metadata.
+
+An explicit diagnostic address wins. Indexed instances such as
+`aws_instance.web[0]` and `aws_instance.web["blue"]`, plus module-prefixed addresses such
+as `module.network.aws_subnet.private[0]`, map back to the source declaration without
+discarding the original identity. Without an address, changed blocks and referenced
+file/line evidence rank candidates. Genuine ambiguity includes at most three blocks and
+is recorded in the manifest; no-diff runs fall back to diagnostic evidence.
+
+References beginning with `var.` and `local.` are resolved selectively. Variables include
+their exact declaration/default. Simple locals include the exact assignment; complex
+locals use the smallest bounded containing block. Direct `data.TYPE.NAME` and resource
+references may add one declaration. Expansion depth is one: references discovered inside
+a supporting block are not recursively followed. `module.*`, `file()`, and
+`templatefile()` are recorded unresolved and never trigger child-module or arbitrary-file
+traversal.
+
+Soft limits independently bound the diagnostic, diff, affected block, supporting context,
+and total selected context. Packing drops lower-priority material first. Oversized HCL is
+reduced only at line boundaries around the diagnostic/changed location and marked with a
+stable truncation reason; it is never summarized or rewritten. Schema-aware and auto modes
+use this same minimal Terraform context and then append the existing complete extracted
+resource schema. Provider schema slicing is deliberately deferred to v0.7.
 
 ## Selective schema inspection
 
@@ -353,10 +440,12 @@ bounded stdout/stderr, and duration. Verification failure does not discard the d
 An initial failure at `git apply --check`, `fmt`, `validate`, or `plan` contains actionable
 evidence and may trigger one dedicated repair call when `--max-repair-attempts 1` is active.
 Patch-check repair applies only after the patch has already passed structural, path, and
-scope safety validation. The repair prompt contains the original Terraform error, relevant
-source and Git diff, original root cause and patch, failed stage, only that command's
-bounded/redacted output, and relevant schemas in schema-aware mode. It tells the model to
-preserve the diagnosis unless the new evidence contradicts it.
+scope safety validation. The repair prompt is rebuilt from structured minimal fields; it
+does not embed the original user prompt or raw log. It contains the diagnostic, affected
+source, relevant change, direct definitions, original diagnosis/patch, failed stage, only
+that command's bounded/redacted output, and schemas only when the original mode was
+schema-aware. It tells the model to preserve the diagnosis unless the new evidence
+contradicts it.
 
 No repair runs for rejected/unsafe patches, structural/path/scope validation failures,
 patch application failures, missing Terraform, unavailable environment/provider
@@ -438,13 +527,50 @@ python -m pytest
 The suite uses temporary arbitrary repositories and mocked OpenRouter/Gemini/Terraform boundaries;
 normal tests require no API key, network, cloud credentials, or installed Terraform CLI.
 Coverage includes discovery, traversal rejection, diff lines, human/JSON/malformed logs,
-unknown and multiple resources, schema selection/missing CLI, all context modes, strict
+unknown and multiple resources, indexed/module addresses, exact block and symbol selection,
+multi-file/no-diff/ambiguous fallbacks, deterministic budgets and de-duplication, section
+telemetry, minimal repair prompts, context manifests/optimization math, schema
+compatibility, arbitrary-file deferral, schema selection/missing CLI, all context modes, strict
 provider JSON, OpenRouter request construction, structured-output fallback, categorized
 errors, bounded transport retries, free/unknown cost handling, secret safety, usage
 aggregation, missing API keys, isolated patch application, plan flags/gating, unsafe first
 and second patches, state and `.terraform` exclusion, output redaction, missing Terraform,
 real Git application, complete attempt history, final status mapping, malformed repair,
 and the exact one-repair bound.
+
+## v0.5 versus v0.6 context benchmark
+
+The comparison harness uses the three diagnostic packages and always emits JSON, JSONL,
+and Markdown under the ignored `evaluation-results/v0.6-context-comparison/` directory:
+
+```bash
+python3 scripts/compare_context.py \
+  --benchmark-root ../terraform-failure-benchmarks/diagnostic-packages
+```
+
+Offline mode deterministically compares prompt characters and leaves input/output/total
+tokens, cost, latency, diagnosis, patch, repair, and verification fields `null`. It never
+derives token claims from characters. Existing result directories can be merged with
+`--v0-5-results DIR --v0-6-results DIR`; each directory should contain `<case-id>.json`.
+
+When Terraform, AWS access, and a valid OpenRouter key are available, both strategies can
+be executed with the same fixed free model:
+
+```bash
+OPENROUTER_API_KEY='...' python3 scripts/compare_context.py \
+  --benchmark-root ../terraform-failure-benchmarks/diagnostic-packages \
+  --live-repository-root ../terraform-failure-benchmarks \
+  --run-live \
+  --model '<provider>/<fixed-model>:free'
+```
+
+Live mode refuses non-`:free` models. Provider-reported input tokens and cost remain the
+authoritative comparison. Free-model output can still be nondeterministic, so verified
+patch status is the strongest regression gate and exact parity may require repeated runs.
+The live repository must contain the complete `cases/<case-id>` configurations and
+collected plan logs; the diagnostic packages remain the deterministic context fixtures.
+When AWS credentials are environment variables, allowlist their names with
+`SEMANTIC_TERRAFORM_AGENT_PASSTHROUGH_ENV` as documented by the isolated verifier.
 
 ## Running against the existing benchmark repository
 
@@ -655,9 +781,9 @@ always required.
 
 ## Recommended next phase
 
-Start v0.6 by using `context_telemetry` and the per-call token baseline to measure prompt
-sections on the three benchmark failures, then implement deterministic minimal-context
-selection with regression tests for diagnosis quality and verified patches. Add progressive
-context escalation and schema slicing only after that baseline is stable. LLMLingua,
-semantic caching, automatic premium routing, billing, dashboard charts, and hard budgets
-remain explicitly deferred.
+Start v0.7 with deterministic provider-schema slicing over the already structured
+`DiagnosisContext`: select the failing resource schema attributes named by the diagnostic,
+affected block, and changed expressions, while retaining exact constraints and measuring
+schema-section characters separately. Do not add progressive escalation until v0.8.
+LLMLingua, semantic caching, automatic premium routing, billing, dashboard charts, and
+hard budgets remain explicitly deferred.

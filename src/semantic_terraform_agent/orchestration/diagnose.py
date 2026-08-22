@@ -14,10 +14,18 @@ from semantic_terraform_agent.collectors.repository import (
     read_source_files,
 )
 from semantic_terraform_agent.config import (
+    DEFAULT_LIMITS,
     InputError,
     parse_provider_name,
     validate_model_id,
 )
+from semantic_terraform_agent.context import ContextBuilder
+from semantic_terraform_agent.context.builder import (
+    minimal_diff,
+    minimal_sources,
+    normalize_resource_address,
+)
+from semantic_terraform_agent.context.legacy import legacy_relevant_sources
 from semantic_terraform_agent.models import (
     Diagnosis,
     DiagnosisCandidate,
@@ -40,6 +48,7 @@ from semantic_terraform_agent.reasoning.prompts import (
     build_prompt_parts,
     build_repair_prompt_parts,
 )
+from semantic_terraform_agent.reasoning.prompt_models import PromptParts
 from semantic_terraform_agent.reasoning.usage import (
     aggregate_usage,
     build_context_telemetry,
@@ -63,31 +72,6 @@ class PatchVerifier(Protocol):
 
 def _elapsed(start: float) -> float:
     return round(time.perf_counter() - start, 6)
-
-
-def _relevant_sources(
-    all_sources: dict[str, str], resources: list, changed_files: tuple[str, ...], failure_file: str | None
-) -> dict[str, str]:
-    if resources:
-        result: dict[str, str] = {}
-        for resource in resources:
-            if not resource.file or not resource.source:
-                continue
-            result.setdefault(resource.file, "")
-            if result[resource.file]:
-                result[resource.file] += "\n\n"
-            result[resource.file] += resource.source
-        if result:
-            return result
-    selected = list(changed_files)
-    if failure_file:
-        matches = [
-            path for path in all_sources if path == failure_file or path.endswith(f"/{failure_file}")
-        ]
-        selected.extend(matches)
-    if not selected:
-        selected = list(all_sources)
-    return {path: all_sources[path] for path in dict.fromkeys(selected) if path in all_sources}
 
 
 def calculate_evidence_score(request: DiagnosisRequest, diagnosis) -> float:
@@ -183,9 +167,12 @@ def diagnose_repository(
     patch_verifier: PatchVerifier | None = None,
     max_repair_attempts: int = 1,
     failed_stage: FailureStage | None = None,
+    context_strategy: Literal[
+        "deterministic-minimal-v1", "legacy-v0.5"
+    ] = "deterministic-minimal-v1",
 ) -> ResultDocument:
     if max_repair_attempts not in (0, 1):
-        raise InputError("max_repair_attempts must be 0 or 1 in version 0.5.0")
+        raise InputError("max_repair_attempts must be 0 or 1 in version 0.6.0")
     selected_provider = parse_provider_name(provider_name)
     selected_model = validate_model_id(selected_provider, model)
     total_start = time.perf_counter()
@@ -214,7 +201,40 @@ def diagnose_repository(
         warnings.append("No affected Terraform resource could be identified from the log and diff.")
 
     started = time.perf_counter()
-    resource_types = [item.resource_type for item in resources]
+    if context_strategy == "legacy-v0.5":
+        diagnosis_context = None
+        relevant_sources = legacy_relevant_sources(
+            all_sources, resources, diff.changed_files, failure.referenced_file
+        )
+        relevant_diff = diff.text
+    else:
+        diagnosis_context = ContextBuilder().build(
+            repository=layout,
+            failure=failure,
+            diff=diff,
+            all_sources=all_sources,
+            detected_resources=resources,
+            mode=context.selected_mode,
+        )
+        relevant_sources = minimal_sources(diagnosis_context)
+        relevant_diff = minimal_diff(diagnosis_context)
+    timing["context_build_seconds"] = _elapsed(started)
+
+    started = time.perf_counter()
+    if diagnosis_context is None:
+        resource_types = [item.resource_type for item in resources]
+    else:
+        resource_types = []
+        for block in diagnosis_context.resource_blocks:
+            identity = normalize_resource_address(block.identifier)
+            if identity and not identity.startswith("data."):
+                resource_types.append(identity.split(".", 1)[0])
+        if not resource_types:
+            resource_types.extend(
+                item.resource_type
+                for item in resources[: DEFAULT_LIMITS.max_context_candidate_blocks]
+            )
+        resource_types = list(dict.fromkeys(resource_types))
     terraform_info, schema_warnings = inspect_schemas(
         layout, resource_types, enabled=context.selected_mode == "schema-aware"
     )
@@ -224,31 +244,31 @@ def diagnose_repository(
     request = DiagnosisRequest(
         failure=failure,
         resources=resources,
-        relevant_sources=_relevant_sources(
-            all_sources, resources, diff.changed_files, failure.referenced_file
-        ),
-        git_diff=diff.text,
+        relevant_sources=relevant_sources,
+        git_diff=relevant_diff,
         context=context,
         schemas=terraform_info.schemas,
         terraform_version=terraform_info.version,
+        diagnosis_context=diagnosis_context,
     )
     llm_calls: list[LLMInvocation] = []
+    prompt_records: list[tuple[LLMInvocation, PromptParts]] = []
     started = time.perf_counter()
     if llm_provider is None:
         llm_provider = create_llm_provider(selected_provider, selected_model)
     diagnosis_prompt = build_prompt_parts(request)
     provider_response = llm_provider.diagnose(request)
     timing["llm_seconds"] = _elapsed(started)
-    llm_calls.append(
-        invocation_from_response(
-            provider_response,
-            provider=selected_provider,
-            requested_model=selected_model,
-            call_type=LLMCallType.DIAGNOSIS,
-            prompt=diagnosis_prompt,
-            latency_ms=round(timing["llm_seconds"] * 1000),
-        )
+    diagnosis_invocation = invocation_from_response(
+        provider_response,
+        provider=selected_provider,
+        requested_model=selected_model,
+        call_type=LLMCallType.DIAGNOSIS,
+        prompt=diagnosis_prompt,
+        latency_ms=round(timing["llm_seconds"] * 1000),
     )
+    llm_calls.append(diagnosis_invocation)
+    prompt_records.append((diagnosis_invocation, diagnosis_prompt))
     initial_model = provider_response.diagnosis
     final_model = initial_model
     repair_model = None
@@ -277,6 +297,7 @@ def diagnose_repository(
             previous_diagnosis=initial_model,
             failed_attempt=first_attempt,
         )
+        repair_prompt = build_repair_prompt_parts(repair_request)
         try:
             repair_response = llm_provider.repair(repair_request)
             repair_model = repair_response.diagnosis
@@ -287,16 +308,16 @@ def diagnose_repository(
         timing["repair_llm_seconds"] = _elapsed(started)
 
         if repair_model is not None:
-            llm_calls.append(
-                invocation_from_response(
-                    repair_response,
-                    provider=selected_provider,
-                    requested_model=selected_model,
-                    call_type=LLMCallType.REPAIR,
-                    prompt=build_repair_prompt_parts(repair_request),
-                    latency_ms=round(timing["repair_llm_seconds"] * 1000),
-                )
+            repair_invocation = invocation_from_response(
+                repair_response,
+                provider=selected_provider,
+                requested_model=selected_model,
+                call_type=LLMCallType.REPAIR,
+                prompt=repair_prompt,
+                latency_ms=round(timing["repair_llm_seconds"] * 1000),
             )
+            llm_calls.append(repair_invocation)
+            prompt_records.append((repair_invocation, repair_prompt))
             started = time.perf_counter()
             try:
                 second_attempt = verifier(repair_model.suggested_patch, layout, attempt=2)
@@ -348,6 +369,10 @@ def diagnose_repository(
         token_usage=legacy_token_usage(llm_usage),
         llm_usage=llm_usage,
         llm_calls=llm_calls,
-        context_telemetry=build_context_telemetry(request, llm_calls[0]),
+        context_telemetry=build_context_telemetry(request, prompt_records),
+        context_manifest=(diagnosis_context.manifest if diagnosis_context else None),
+        context_optimization=(
+            diagnosis_context.optimization if diagnosis_context else None
+        ),
         warnings=warnings,
     )

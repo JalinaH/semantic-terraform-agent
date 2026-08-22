@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 from semantic_terraform_agent.models import (
+    ContextCallTelemetry,
+    ContextSectionTelemetry,
     ContextTelemetry,
     DiagnosisRequest,
     LLMCallType,
@@ -14,7 +16,7 @@ from semantic_terraform_agent.models import (
     ProviderResponse,
     TokenUsage,
 )
-from semantic_terraform_agent.reasoning.prompts import PromptParts
+from semantic_terraform_agent.reasoning.prompt_models import PromptParts
 
 
 def invocation_from_response(
@@ -82,20 +84,69 @@ def legacy_token_usage(usage: LLMUsage) -> TokenUsage:
 
 
 def build_context_telemetry(
-    request: DiagnosisRequest, invocation: LLMInvocation
+    request: DiagnosisRequest,
+    prompt_records: Iterable[tuple[LLMInvocation, PromptParts]],
 ) -> ContextTelemetry:
+    records = list(prompt_records)
+    if not records:
+        raise ValueError("at least one prompt record is required")
+    invocation, prompt = records[0]
+    diagnosis_context = request.diagnosis_context
+    schema_included = (
+        request.context.selected_mode == "schema-aware"
+        and any(
+            record.extraction_status == "ok" and record.resource_schema is not None
+            for record in request.schemas
+        )
+    )
+
+    def sections(parts: PromptParts) -> dict[str, ContextSectionTelemetry]:
+        return {
+            name: ContextSectionTelemetry(characters=characters)
+            for name, characters in parts.section_characters.items()
+        }
+
     return ContextTelemetry(
         mode=request.context.selected_mode,
         prompt_characters=invocation.prompt_characters,
         system_prompt_characters=invocation.system_prompt_characters,
         user_prompt_characters=invocation.user_prompt_characters,
-        resource_schema_included=(
-            request.context.selected_mode == "schema-aware"
-            and any(
-                record.extraction_status == "ok" and record.resource_schema is not None
-                for record in request.schemas
-            )
-        ),
+        resource_schema_included=schema_included,
         git_diff_included=bool(request.git_diff.strip()),
-        source_file_count=len(request.relevant_sources),
+        source_file_count=(
+            len(diagnosis_context.manifest.included_files)
+            if diagnosis_context is not None
+            else len(request.relevant_sources)
+        ),
+        source_block_count=(
+            len(diagnosis_context.resource_blocks)
+            + len(diagnosis_context.supporting_blocks)
+            if diagnosis_context is not None
+            else 0
+        ),
+        changed_line_count=(
+            diagnosis_context.manifest.changed_lines
+            if diagnosis_context is not None
+            else 0
+        ),
+        referenced_symbol_count=(
+            len(diagnosis_context.referenced_symbols)
+            if diagnosis_context is not None
+            else 0
+        ),
+        schema_included=schema_included,
+        selected_context_characters=prompt.selected_context_characters,
+        rendered_user_prompt_characters=len(prompt.user),
+        sections=sections(prompt),
+        calls=[
+            ContextCallTelemetry(
+                call_type=call.call_type,
+                prompt_characters=call.prompt_characters,
+                system_prompt_characters=call.system_prompt_characters,
+                user_prompt_characters=call.user_prompt_characters,
+                selected_context_characters=parts.selected_context_characters,
+                sections=sections(parts),
+            )
+            for call, parts in records
+        ],
     )

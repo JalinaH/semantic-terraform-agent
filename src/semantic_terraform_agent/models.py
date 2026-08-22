@@ -92,6 +92,81 @@ class ContextSelection(StrictModel):
     selection_reason: str
 
 
+class ContextFailure(StrictModel):
+    summary: str
+    detail: str
+    stage: FailureStage
+    resource_address: str | None = None
+    referenced_file: str | None = None
+    referenced_line: int | None = None
+    diagnostic_excerpt: str | None = None
+
+
+class ChangedLineContext(StrictModel):
+    file: str
+    old_start: int = Field(ge=0)
+    new_start: int = Field(ge=0)
+    added_lines: list[str] = Field(default_factory=list)
+    removed_lines: list[str] = Field(default_factory=list)
+    context_lines: list[str] = Field(default_factory=list)
+    rendered: str
+    truncated: bool = False
+
+
+ContextBlockKind: TypeAlias = Literal["resource", "data", "variable", "local"]
+
+
+class ContextSourceBlock(StrictModel):
+    kind: ContextBlockKind
+    identifier: str
+    file: str
+    start_line: int = Field(ge=1)
+    end_line: int = Field(ge=1)
+    source: str
+    truncated: bool = False
+    truncation_reason: str | None = None
+
+
+class ContextManifest(StrictModel):
+    included_files: list[str] = Field(default_factory=list)
+    included_resources: list[str] = Field(default_factory=list)
+    included_symbols: list[str] = Field(default_factory=list)
+    referenced_symbols: list[str] = Field(default_factory=list)
+    resolved_symbols: list[str] = Field(default_factory=list)
+    unresolved_symbols: list[str] = Field(default_factory=list)
+    changed_lines: int = Field(default=0, ge=0)
+    truncated_sections: list[str] = Field(default_factory=list)
+    ambiguous: bool = False
+
+
+class ContextOptimization(StrictModel):
+    strategy: Literal["deterministic_minimal_v1"] = "deterministic_minimal_v1"
+    available_source_characters: int | None = Field(default=None, ge=0)
+    selected_source_characters: int | None = Field(default=None, ge=0)
+    characters_avoided: int | None = Field(default=None, ge=0)
+    reduction_ratio: float | None = Field(default=None, ge=0.0, le=1.0)
+    character_reduction_ratio: float | None = Field(default=None, ge=0.0, le=1.0)
+    input_token_reduction_ratio: float | None = Field(default=None, ge=0.0, le=1.0)
+    available_source_file_count: int | None = Field(default=None, ge=0)
+    selected_source_file_count: int | None = Field(default=None, ge=0)
+    available_resource_count: int | None = Field(default=None, ge=0)
+    selected_resource_count: int | None = Field(default=None, ge=0)
+
+
+class DiagnosisContext(StrictModel):
+    failure: ContextFailure
+    changed_lines: list[ChangedLineContext] = Field(default_factory=list)
+    resource_blocks: list[ContextSourceBlock] = Field(default_factory=list)
+    supporting_blocks: list[ContextSourceBlock] = Field(default_factory=list)
+    referenced_symbols: list[str] = Field(default_factory=list)
+    resolved_symbols: list[str] = Field(default_factory=list)
+    unresolved_symbols: list[str] = Field(default_factory=list)
+    metadata: dict[str, str | int | bool | None] = Field(default_factory=dict)
+    manifest: ContextManifest
+    optimization: ContextOptimization
+    selected_context_characters: int = Field(ge=0)
+
+
 class EvidenceItem(StrictModel):
     source: Literal["terraform_error", "terraform_source", "git_diff", "provider_schema"]
     detail: str
@@ -226,6 +301,27 @@ class ContextTelemetry(StrictModel):
     resource_schema_included: bool
     git_diff_included: bool
     source_file_count: int = Field(ge=0)
+    source_block_count: int = Field(default=0, ge=0)
+    changed_line_count: int = Field(default=0, ge=0)
+    referenced_symbol_count: int = Field(default=0, ge=0)
+    schema_included: bool = False
+    selected_context_characters: int | None = Field(default=None, ge=0)
+    rendered_user_prompt_characters: int | None = Field(default=None, ge=0)
+    sections: dict[str, "ContextSectionTelemetry"] = Field(default_factory=dict)
+    calls: list["ContextCallTelemetry"] = Field(default_factory=list)
+
+
+class ContextSectionTelemetry(StrictModel):
+    characters: int = Field(ge=0)
+
+
+class ContextCallTelemetry(StrictModel):
+    call_type: LLMCallType
+    prompt_characters: int = Field(ge=0)
+    system_prompt_characters: int = Field(ge=0)
+    user_prompt_characters: int = Field(ge=0)
+    selected_context_characters: int | None = Field(default=None, ge=0)
+    sections: dict[str, ContextSectionTelemetry] = Field(default_factory=dict)
 
 
 class DiagnosisRequest(StrictModel):
@@ -236,6 +332,7 @@ class DiagnosisRequest(StrictModel):
     context: ContextSelection
     schemas: list[SchemaRecord]
     terraform_version: str | None = None
+    diagnosis_context: DiagnosisContext | None = None
 
 
 class RepairRequest(StrictModel):
@@ -262,6 +359,8 @@ class ResultDocument(StrictModel):
     llm_usage: LLMUsage = Field(default_factory=LLMUsage)
     llm_calls: list[LLMInvocation] = Field(default_factory=list)
     context_telemetry: ContextTelemetry | None = None
+    context_manifest: ContextManifest | None = None
+    context_optimization: ContextOptimization | None = None
     warnings: list[str] = Field(default_factory=list)
     error: str | None = None
     error_code: ProviderFailureCategory | None = None

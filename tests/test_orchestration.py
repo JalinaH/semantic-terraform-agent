@@ -155,6 +155,15 @@ def test_successful_first_attempt_has_no_repair(
     assert result.context_telemetry.mode == "lightweight"
     assert result.context_telemetry.git_diff_included is True
     assert result.context_telemetry.source_file_count == 1
+    assert result.context_telemetry.source_block_count == 1
+    assert result.context_telemetry.sections["terraform_error"].characters > 0
+    assert result.context_telemetry.sections["terraform_source"].characters > 0
+    assert result.context_telemetry.calls[0].call_type.value == "diagnosis"
+    assert result.context_manifest.included_resources == ["example_widget.primary"]
+    assert result.context_manifest.ambiguous is False
+    assert result.context_optimization.strategy == "deterministic_minimal_v1"
+    assert result.context_optimization.input_token_reduction_ratio is None
+    assert "context_build_seconds" in result.timing
 
 
 def test_explicit_failed_stage_overrides_log_inference(
@@ -219,6 +228,16 @@ def test_successful_second_attempt_preserves_history_and_confidence(
     assert result.llm_usage.cost_usd is None
     assert result.llm_usage.cost_complete is False
     assert [call.call_type.value for call in result.llm_calls] == ["diagnosis", "repair"]
+    assert [call.call_type.value for call in result.context_telemetry.calls] == [
+        "diagnosis",
+        "repair",
+    ]
+    assert (
+        result.context_telemetry.calls[1]
+        .sections["verification_evidence"]
+        .characters
+        > 0
+    )
 
 
 def test_patch_check_failure_can_trigger_one_safe_repair(

@@ -50,6 +50,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
     )
     diagnose.add_argument(
+        "--context-strategy",
+        choices=("deterministic-minimal-v1", "legacy-v0.5"),
+        default="deterministic-minimal-v1",
+        help=argparse.SUPPRESS,
+    )
+    diagnose.add_argument(
         "--verify-patch",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -171,6 +177,41 @@ def _print_summary(result: ResultDocument, output: Path) -> None:
             else "  Cost:           not reported"
         )
     )
+    optimization = result.context_optimization
+    manifest = result.context_manifest
+    if optimization is not None and manifest is not None:
+        available_files = optimization.available_source_file_count
+        selected_files = optimization.selected_source_file_count
+        available_resources = optimization.available_resource_count
+        selected_resources = optimization.selected_resource_count
+        available_characters = optimization.available_source_characters
+        selected_characters = optimization.selected_source_characters
+        reduction = optimization.character_reduction_ratio
+        print("Context optimization:")
+        print(f"  Strategy:            {optimization.strategy}")
+        print(
+            "  Terraform files:     "
+            f"{_format_count(available_files)} available / "
+            f"{_format_count(selected_files)} included"
+        )
+        print(
+            "  Resources:           "
+            f"{_format_count(available_resources)} available / "
+            f"{_format_count(selected_resources)} included"
+        )
+        print(f"  Supporting symbols:  {len(manifest.included_symbols)}")
+        if available_characters is not None and selected_characters is not None:
+            print(
+                "  Source characters:   "
+                f"{available_characters:,} → {selected_characters:,}"
+            )
+        else:
+            print("  Source characters:   not comparable")
+        print(
+            f"  Reduction:           {reduction:.1%}"
+            if reduction is not None
+            else "  Reduction:           not comparable"
+        )
     print(f"Result: {output.expanduser().resolve(strict=False)}")
     if result.warnings:
         print(f"Warnings: {len(result.warnings)}")
@@ -178,6 +219,10 @@ def _print_summary(result: ResultDocument, output: Path) -> None:
 
 def _format_tokens(value: int | None) -> str:
     return f"{value:,}" if value is not None else "not reported"
+
+
+def _format_count(value: int | None) -> str:
+    return f"{value:,}" if value is not None else "unknown"
 
 
 def _render_ci(args: argparse.Namespace) -> int:
@@ -231,6 +276,7 @@ def main(argv: list[str] | None = None) -> int:
             verification_enabled=args.verify_patch,
             max_repair_attempts=args.max_repair_attempts,
             failed_stage=args.failed_stage,
+            context_strategy=args.context_strategy,
         )
         _write_result(args.output, result)
     except (AgentError, OSError, ValidationError, ValueError) as exc:
