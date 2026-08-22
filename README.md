@@ -12,14 +12,13 @@ implementation.
 
 ## Status and scope
 
-Version `0.8.0` adds progressive deterministic context escalation on top of minimal
-Terraform context and provider-schema slicing. Production `auto` mode begins without a
-provider schema, verifies the first candidate, and retrieves a sliced schema only when a
-cheap deterministic classifier identifies missing provider-semantic evidence. Formatting
-failures use the existing minimal-context repair; environment and unsafe-patch failures
-stop. Both attempts use the same provider and requested model, and the hard limit remains
-two model calls. Critical HCL and schema definitions remain exact; there is no LLM-based
-selection, lossy compression, model routing, or caching.
+Version `0.9.0` adds deterministic cost-tier model routing as a policy independent from
+progressive context escalation. Fixed routing remains the default and preserves v0.8's
+same-model behavior. Auto routing selects the cheapest eligible configured model, keeps
+formatting repair on that model, and may move a schema/context escalation to the next
+eligible tier without exceeding the caller's ceiling. Routing reads a strict local
+registry and performs no provider catalog request. The hard limit remains two semantic
+model calls, and actual cost remains provider-reported rather than estimated.
 
 ```text
 repository + failure log
@@ -29,10 +28,12 @@ repository + failure log
   -> affected resource block(s)
   -> direct var/local/data/resource definitions (depth 1)
   -> deterministic context selection
+  -> local model-registry filtering and deterministic initial model selection
   -> provider-neutral Gemini or OpenRouter structured diagnosis with minimal context
   -> isolated patch application + fmt/init/validate/plan
   -> deterministic stop / minimal repair / sliced-schema escalation decision
-  -> at most one same-model second attempt + fresh verification
+  -> independent second-call model decision within the configured tier ceiling
+  -> at most one second attempt + fresh verification
   -> result JSON + concise terminal and LLM usage summary
   -> optional GitHub Step Summary and idempotent pull-request comment
 ```
@@ -70,6 +71,8 @@ semantic-terraform-agent diagnose \
   --failed-stage plan \
   --provider openrouter \
   --model '<provider>/<model>:free' \
+  --model-routing fixed \
+  --max-model-tier premium \
   --context-mode auto \
   --verify-patch \
   --max-repair-attempts 1 \
@@ -92,11 +95,12 @@ identify a resource.
 - `schema-aware`: adds deterministic slices of matched resource schemas and provider metadata.
 - `auto`: starts minimal and applies progressive deterministic escalation after verification.
 
-The default Gemini model is `gemini-2.5-flash`. OpenRouter requires an explicit dynamic
-model ID in `provider/model` form; the agent does not maintain a fixed model allowlist.
+The default fixed Gemini model is `gemini-2.5-flash`. Fixed OpenRouter routing requires an
+explicit dynamic model ID in `provider/model` form; auto routing may choose from a local
+registry.
 Patch verification is enabled by default. Use `--no-verify-patch` to record a
 deliberately skipped verification in environments where local commands must not run.
-`--max-repair-attempts` accepts only `0` or `1` in version 0.8.0 and defaults to `1`.
+`--max-repair-attempts` accepts only `0` or `1` in version 0.9.0 and defaults to `1`.
 The value bounds the unified second opportunity: either minimal-context repair or schema
 context escalation, never both. Use `0` to verify the initial patch without a second call.
 
@@ -128,7 +132,49 @@ OpenRouter model IDs remain dynamic because catalog availability changes. The CL
 conservatively validated IDs such as `<provider>/<model>` and
 `<provider>/<model>:free`, as well as `openrouter/free`. Control characters, whitespace,
 malformed unqualified IDs, and IDs longer than 200 characters are rejected locally.
-Tier policy and model allowlisting belong to the future dashboard, not the agent core.
+The agent consumes caller-supplied tier ceilings; subscription and pricing policy remain
+outside the agent core.
+
+## Model registry and cost-tier routing
+
+Model routing is deliberately separate from context selection:
+
+```text
+ContextEscalationPolicy -> stop / repair / minimal-to-schema context
+ModelRoutingPolicy      -> provider-scoped model allowed for that call
+```
+
+`--model-routing fixed` is the default. It accepts dynamic model IDs, including models
+not present in the registry, and uses the requested provider/model for both calls. If a
+registered model is explicitly disabled or lacks a supported structured-JSON/fallback
+path, explicit selection fails safely.
+
+`--model-routing auto` reads a local registry, filters to the selected `--provider`,
+enabled entries, supported JSON response behavior, and `--max-model-tier`, then sorts by
+`FREE < ECONOMY < BALANCED < PREMIUM`, ascending integer `priority`, and model ID. The
+lowest priority number is preferred within a tier. An optional explicit `--model` anchors
+call one but must be registered and within the ceiling; omitting it chooses the cheapest
+eligible candidate. Routing never jumps between OpenRouter and direct Gemini.
+
+For a second call, ordinary repair reuses the initial model. Context/schema escalation
+selects the cheapest configured tier above the initial tier. If no higher eligible model
+exists—or the ceiling is already reached—the initial model is reused. A FREE ceiling is
+therefore a hard FREE-only mode. `ECONOMY` allows FREE→ECONOMY, and `PREMIUM` makes every
+tier eligible without requiring a premium call.
+
+Registry configuration is supplied with `--model-registry PATH`,
+`SEMANTIC_TERRAFORM_MODEL_REGISTRY_PATH`, or the compatible
+`OPENROUTER_MODEL_REGISTRY_PATH`. The strict JSON shape is demonstrated in
+[`examples/model-registry.json`](examples/model-registry.json). That file contains
+replaceable examples, not permanent availability claims. Entries contain provider, model
+ID, tier, priority, enabled/capability flags, optional context size, and notes—never API
+keys. Duplicate entries, malformed fields, invalid IDs, secret-shaped extra fields, and
+oversized registries fail before repository or provider access.
+
+The built-in registry contains only the stable direct-Gemini compatibility default. Auto
+OpenRouter routing should use an explicitly maintained local registry; `openrouter/free`
+remains valid for fixed explicit use but is unsuitable for deterministic comparisons
+because its underlying model may vary.
 
 For zero-cost development, either select a currently available fixed `:free` model or use
 `openrouter/free`:
@@ -471,7 +517,7 @@ diagnostic, selected Terraform blocks, relevant diff, and bounded one-hop defini
 does not inspect or include provider schema. After isolated verification,
 `ContextEscalationPolicy` returns one structured `stop`, `repair`, or `escalate` decision.
 The `EXPANDED` level exists in the data model for future work but is never selected
-automatically in v0.8.
+automatically in v0.9.
 
 Decision precedence is deterministic:
 
@@ -501,7 +547,8 @@ never repeated within a run and has no cross-run cache.
 Explicit `lightweight` never escalates and retains one minimal-context repair. Explicit
 `schema-aware` retrieves sliced schema before its first call and retains one schema-aware
 repair. There is no loop: one initial call plus at most one repair or escalation call, with
-the same provider and requested model. A second failed verification always stops.
+the same provider scope. Fixed routing preserves the requested model; auto routing may use
+the next eligible tier for context escalation. A second failed verification always stops.
 
 The diagnosis contract is:
 
@@ -548,6 +595,20 @@ Timing includes `initial_context_build_seconds`, `initial_llm_seconds`,
 `second_verification_seconds`, while existing aggregate timing keys remain available.
 Auto runs also expose `schema_avoided`; explicit modes leave it null.
 
+`model_progression` remains separate and records routing mode, initial/final model and
+tier, whether the model or tier changed, maximum allowed tier, models used, and structured
+routing decisions. Each decision includes call number, requested and selected model,
+provider, tier, candidate count, and a machine-readable reason. `llm_calls` adds
+`routing_tier`, `routing_reason`, and `call_number` without replacing existing provider,
+requested/reported model, token, cost, or latency fields.
+
+`model_routing_seconds`, `initial_model_routing_seconds`, and
+`second_model_routing_seconds` measure local registry filtering and sorting only.
+`llm_usage.call_count` continues to count successfully validated provider responses; the
+orchestrator separately bounds attempted semantic calls to two. Provider transport retries
+stay inside their adapters. v0.9 does not autonomously hop models after a transport or
+model-unavailable error.
+
 ## Direct Gemini support
 
 `GeminiProvider` remains a first-class implementation of the same provider-neutral
@@ -559,8 +620,8 @@ Missing fields, out-of-range confidence, invalid evidence sources, or arbitrary 
 fields reject either provider's response.
 
 The output document includes repository/diff metadata, Terraform/schema metadata, parsed
-failure, selected context and reason, diagnosis, nested patch verification, timings, token
-usage, and warnings. Initial and repair model responses keep their own confidence; the
+failure, separate context/model progression, routing decisions, diagnosis, nested patch
+verification, timings, token usage, and warnings. Initial and repair model responses keep their own confidence; the
 top-level `model_confidence` is the final model estimate. A separate `evidence_score`
 checks identified resource evidence, error evidence, diff evidence, a non-empty patch,
 and schema evidence when schema-aware mode is used. Verification contributes a separate
@@ -597,6 +658,9 @@ siblings, description/path/depth budgets, malformed-schema fallback, schema mani
 telemetry, arbitrary-file deferral, schema selection/missing CLI, all context modes,
 minimal-first auto behavior, semantic escalation, formatting repair, environment stopping,
 verification-error relationships, call bounds, schema avoidance, progression telemetry,
+model registry validation, tier ceilings, deterministic routing priority, capability and
+provider filtering, fixed/auto/hybrid routing, FREE-only routing, repair reuse, next-tier
+context escalation, routing telemetry, cost-per-verified-fix completeness, and both
 three-strategy evaluation aggregates,
 strict provider JSON, OpenRouter request construction, structured-output fallback,
 categorized errors, bounded transport retries, free/unknown cost handling, secret safety,
@@ -710,6 +774,50 @@ Live mode refuses non-`:free` models. Terraform, provider access, benchmark case
 and any required cloud credentials must be available. Provider-reported usage and verified
 patch status are authoritative; free-model nondeterminism remains an evaluation limitation.
 
+## v0.9 model-routing benchmark
+
+The routing harness holds progressive context constant and compares `fixed_cheap`,
+`fixed_strong`, and `routed` (`cheap → higher-tier when schema escalation is needed`):
+
+```bash
+python3 scripts/compare_model_routing.py \
+  --cheap-model 'provider/lower-tier-model:free' \
+  --strong-model 'provider/higher-tier-model:free' \
+  --cheap-tier free \
+  --strong-tier economy
+```
+
+It writes `results.json`, `results.jsonl`, and `comparison.md` under the ignored
+`evaluation-results/v0.9-model-routing/` directory. Offline mode records deterministic
+initial and context-escalation policy selections for all three benchmark cases. It leaves
+actual model calls, progression, verification, tokens, cost, and latency uncollected.
+Configured tiers in an all-free experiment are experimental product metadata, not claims
+about model quality or current provider pricing.
+
+Existing result directories can be merged using `--fixed-cheap-results DIR`,
+`--fixed-strong-results DIR`, and `--routed-results DIR`. Aggregates include overall and
+first-call verification rates, model escalation, higher-tier avoidance, mean usage/cost/
+latency, and cost per verified fix. Cost per verified fix is computed only when every
+included run has complete provider-reported cost data; explicit `0.0` remains known zero
+and `null` remains unknown.
+
+Live OpenRouter evaluation requires the complete benchmark checkout and two fixed models:
+
+```bash
+OPENROUTER_API_KEY='...' python3 scripts/compare_model_routing.py \
+  --benchmark-root ../terraform-failure-benchmarks/diagnostic-packages \
+  --live-repository-root ../terraform-failure-benchmarks \
+  --cheap-model '<provider>/<lower-model>:free' \
+  --strong-model '<provider>/<higher-model>:free' \
+  --cheap-tier free \
+  --strong-tier economy \
+  --run-live
+```
+
+Without `--allow-paid-models`, live evaluation rejects any model ID not ending in `:free`.
+The routed experiment uses one provider, one fixed pair, and independent runs per case; it
+does not use `openrouter/free` because the underlying model may vary.
+
 ## Running against the existing benchmark repository
 
 From this repository's directory, with Terraform installed and `OPENROUTER_API_KEY`
@@ -799,8 +907,11 @@ for trusted same-repository pull requests—creates or updates one bot comment.
 | `terraform_version` | no | `1.15.7` | Terraform used for isolated verification |
 | `provider` | no | `gemini` | Provider-neutral selector: `gemini` or `openrouter` |
 | `model` | no | `gemini-3.6-flash` | Dynamic provider model ID; override for OpenRouter |
+| `model_routing` | no | `fixed` | `fixed` or local-registry-driven `auto` |
+| `max_model_tier` | no | `premium` | `free`, `economy`, `balanced`, or `premium` ceiling |
+| `model_registry_path` | no | empty | Optional caller-repository-relative registry JSON |
 | `context_mode` | no | `auto` | `lightweight`, `schema-aware`, or `auto` |
-| `max_repair_attempts` | no | `1` | Bounded value `0` or `1` |
+| `max_repair_attempts` | no | `1` | Bounded second-call opportunity: `0` or `1` |
 | `aws_region` | yes | — | Region for OIDC-authenticated Terraform verification |
 
 Required workflow secrets are `AWS_ROLE_ARN` plus the selected provider key:
@@ -839,8 +950,10 @@ semantic-terraform-agent:
 For production use, pin `uses:` to a reviewed release tag or commit SHA instead of a
 mutable branch. A complete validate/plan/log-upload example is available at
 [`examples/github-actions/consumer.yml`](examples/github-actions/consumer.yml).
-To use OpenRouter, set `provider: openrouter`, set an explicit `model`, and pass
-`OPENROUTER_API_KEY` instead of `GEMINI_API_KEY` in the caller's `secrets` mapping.
+To use fixed OpenRouter routing, set `provider: openrouter`, set an explicit `model`, and
+pass `OPENROUTER_API_KEY` instead of `GEMINI_API_KEY`. For auto routing, additionally set
+`model_routing`, `max_model_tier`, and a reviewed `model_registry_path`; set `model` to an
+empty input to let policy choose call one, or set it to a registered explicit anchor.
 
 ### Failure evidence and commit/diff selection
 
@@ -919,9 +1032,9 @@ always required.
 
 ## Recommended next phase
 
-Start v0.9 with a cost-aware model-routing policy layered outside the now-observable
-context progression. Define deterministic model tiers and eligibility, keep the v0.8
-context decision independent, compare models on the same benchmark inputs, and preserve
-the two-call ceiling before considering any cheap-to-strong route. LLMLingua, semantic
-caching, verified-failure memory, billing, dashboard charts, and hard budgets remain
-explicitly deferred.
+Start v0.10 with a conservative semantic-failure cache and verified-failure memory keyed
+by normalized failure signature, affected resource identity, exact relevant HCL, provider
+schema/version identity, and policy versions. Cache hits must never bypass isolated patch
+verification, and only verified outcomes should be reusable. Keep invalidation,
+provenance, security boundaries, and measurable hit/verification rates explicit.
+LLMLingua, billing, dashboard charts, and hard budgets remain deferred.

@@ -1,0 +1,28 @@
+{
+  "models": [
+    {
+      "provider": "openrouter",
+      "model_id": "replace-with-provider/free-model-a:free",
+      "tier": "free",
+      "priority": 10,
+      "enabled": true,
+      "supports_structured_output": true,
+      "supports_json_fallback": true,
+      "supports_tools": false,
+      "max_context_tokens": null,
+      "notes": "Example only; replace with a currently available model before use."
+    },
+    {
+      "provider": "openrouter",
+      "model_id": "replace-with-provider/free-model-b:free",
+      "tier": "free",
+      "priority": 20,
+      "enabled": false,
+      "supports_structured_output": true,
+      "supports_json_fallback": true,
+      "supports_tools": false,
+      "max_context_tokens": null,
+      "notes": "Disabled example showing deterministic same-tier priority."
+    }
+  ]
+}

@@ -173,7 +173,11 @@ def test_successful_first_attempt_has_no_repair(
     assert result.schema_slice_manifest == []
     assert result.context_telemetry.sections["provider_schema"].characters == 0
     _print_summary(result, Path("result.json"))
-    assert "Provider schema:     not used" in capsys.readouterr().out
+    rendered = capsys.readouterr().out
+    assert "Provider schema:     not used" in rendered
+    assert "Model routing:" in rendered
+    assert "Mode:              fixed" in rendered
+    assert "Model escalated:   no" in rendered
 
 
 def test_schema_aware_orchestration_slices_locally_and_persists_only_manifest(

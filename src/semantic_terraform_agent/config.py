@@ -8,6 +8,7 @@ from pathlib import Path
 
 from semantic_terraform_agent.models import (
     LLMProviderName,
+    ModelRoutingErrorCode,
     ProviderFailureCategory,
 )
 
@@ -31,6 +32,14 @@ class ProviderError(AgentError):
     ) -> None:
         super().__init__(message)
         self.category = category
+
+
+class ModelRoutingError(AgentError):
+    """The local model registry or routing policy is invalid."""
+
+    def __init__(self, message: str, *, code: ModelRoutingErrorCode) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 @dataclass(frozen=True)

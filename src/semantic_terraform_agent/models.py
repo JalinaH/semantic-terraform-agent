@@ -5,7 +5,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Literal, TypeAlias
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt
 
 
 class StrictModel(BaseModel):
@@ -26,6 +26,18 @@ class ContextLevel(str, Enum):
     MINIMAL = "minimal"
     SCHEMA = "schema"
     EXPANDED = "expanded"
+
+
+class ModelTier(str, Enum):
+    FREE = "free"
+    ECONOMY = "economy"
+    BALANCED = "balanced"
+    PREMIUM = "premium"
+
+
+class ModelRoutingMode(str, Enum):
+    FIXED = "fixed"
+    AUTO = "auto"
 
 
 class SecondAttemptReason(str, Enum):
@@ -65,6 +77,26 @@ EscalationReasonCode: TypeAlias = Literal[
     "second_attempt_disabled",
     "schema_unavailable",
     "no_actionable_failure",
+]
+
+
+RoutingReasonCode: TypeAlias = Literal[
+    "fixed_model",
+    "explicit_model",
+    "initial_cheapest_eligible",
+    "repair_same_model",
+    "context_escalation_next_tier",
+    "tier_ceiling_reuse",
+    "no_stronger_model_available",
+]
+
+ModelRoutingErrorCode: TypeAlias = Literal[
+    "no_eligible_model",
+    "invalid_model_registry",
+    "model_tier_violation",
+    "explicit_model_disabled",
+    "explicit_model_not_registered",
+    "model_capability_unsupported",
 ]
 
 
@@ -130,6 +162,44 @@ class TerraformInfo(StrictModel):
     schema_retrieval_command: list[str] | None = None
     schema_extraction_status: str
     schemas: list[SchemaRecord] = Field(default_factory=list)
+
+
+class ModelDefinition(StrictModel):
+    provider: LLMProviderName
+    model_id: str = Field(min_length=1, max_length=200)
+    tier: ModelTier
+    priority: StrictInt = 100
+    enabled: StrictBool = True
+    supports_structured_output: StrictBool = True
+    supports_json_fallback: StrictBool = False
+    supports_tools: StrictBool = False
+    max_context_tokens: StrictInt | None = Field(default=None, gt=0)
+    notes: str | None = Field(default=None, max_length=500)
+
+
+class ModelRoutingDecision(StrictModel):
+    call_number: int = Field(ge=1, le=2)
+    routing_mode: ModelRoutingMode
+    requested_model: str | None = None
+    selected_provider: LLMProviderName
+    selected_model: str
+    selected_tier: ModelTier | None = None
+    max_allowed_tier: ModelTier
+    reason_code: RoutingReasonCode
+    candidate_count: int = Field(default=0, ge=0)
+
+
+class ModelProgression(StrictModel):
+    routing_mode: ModelRoutingMode
+    initial_model: str
+    final_model: str
+    initial_tier: ModelTier | None = None
+    final_tier: ModelTier | None = None
+    model_escalated: bool
+    tier_escalated: bool
+    max_allowed_tier: ModelTier
+    models_used: list[str]
+    decisions: list[ModelRoutingDecision]
 
 
 class ContextSelection(StrictModel):
@@ -423,6 +493,9 @@ class LLMInvocation(StrictModel):
     cache_hit: bool | None = None
     call_type: LLMCallType
     context_level: ContextLevel | None = None
+    routing_tier: ModelTier | None = None
+    routing_reason: RoutingReasonCode | None = None
+    call_number: int | None = Field(default=None, ge=1, le=2)
     prompt_characters: int = Field(ge=0)
     system_prompt_characters: int = Field(ge=0)
     user_prompt_characters: int = Field(ge=0)
@@ -530,6 +603,8 @@ class ResultDocument(StrictModel):
     schema_slice_manifest: list[SchemaSliceManifest] = Field(default_factory=list)
     schema_optimization: SchemaOptimization | None = None
     context_progression: ContextProgression | None = None
+    model_progression: ModelProgression | None = None
     warnings: list[str] = Field(default_factory=list)
     error: str | None = None
     error_code: ProviderFailureCategory | None = None
+    routing_error_code: ModelRoutingErrorCode | None = None

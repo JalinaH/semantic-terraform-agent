@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Literal, Protocol
 
@@ -16,8 +17,8 @@ from semantic_terraform_agent.collectors.repository import (
 from semantic_terraform_agent.config import (
     DEFAULT_LIMITS,
     InputError,
+    ModelRoutingError,
     parse_provider_name,
-    validate_model_id,
 )
 from semantic_terraform_agent.context import (
     ContextBuilder,
@@ -42,6 +43,9 @@ from semantic_terraform_agent.models import (
     LLMCallType,
     LLMInvocation,
     LLMProviderName,
+    ModelProgression,
+    ModelRoutingMode,
+    ModelTier,
     RepairRequest,
     RepositoryInfo,
     ResultDocument,
@@ -54,11 +58,13 @@ from semantic_terraform_agent.models import (
 )
 from semantic_terraform_agent.reasoning.base import LLMProvider
 from semantic_terraform_agent.reasoning.factory import create_llm_provider
+from semantic_terraform_agent.reasoning.model_registry import ModelRegistry
 from semantic_terraform_agent.reasoning.prompt_models import PromptParts
 from semantic_terraform_agent.reasoning.prompts import (
     build_prompt_parts,
     build_repair_prompt_parts,
 )
+from semantic_terraform_agent.reasoning.routing import ModelRoutingPolicy, TIER_ORDER
 from semantic_terraform_agent.reasoning.usage import (
     aggregate_usage,
     build_context_telemetry,
@@ -78,6 +84,9 @@ class PatchVerifier(Protocol):
     def __call__(
         self, patch: str, layout: RepositoryLayout, *, attempt: int
     ) -> VerificationAttempt: ...
+
+
+ProviderFactory = Callable[[LLMProviderName, str], LLMProvider]
 
 
 def _elapsed(start: float) -> float:
@@ -208,9 +217,14 @@ def diagnose_repository(
     log_file: Path,
     diff_file: Path | None,
     provider_name: str | LLMProviderName,
-    model: str,
+    model: str | None,
     context_mode: Literal["lightweight", "schema-aware", "auto"],
     llm_provider: LLMProvider | None = None,
+    provider_factory: ProviderFactory | None = None,
+    model_routing: Literal["fixed", "auto"] = "fixed",
+    max_model_tier: Literal["free", "economy", "balanced", "premium"] = "premium",
+    model_registry_path: Path | None = None,
+    model_registry: ModelRegistry | None = None,
     verification_enabled: bool = True,
     patch_verifier: PatchVerifier | None = None,
     max_repair_attempts: int = 1,
@@ -221,9 +235,8 @@ def diagnose_repository(
     schema_strategy: Literal["sliced", "full"] = "sliced",
 ) -> ResultDocument:
     if max_repair_attempts not in (0, 1):
-        raise InputError("max_repair_attempts must be 0 or 1 in version 0.8.0")
+        raise InputError("max_repair_attempts must be 0 or 1 in version 0.9.0")
     selected_provider = parse_provider_name(provider_name)
-    selected_model = validate_model_id(selected_provider, model)
     total_start = time.perf_counter()
     timing: dict[str, float] = {
         "initial_context_build_seconds": 0.0,
@@ -234,8 +247,30 @@ def diagnose_repository(
         "schema_slice_seconds": 0.0,
         "second_llm_seconds": 0.0,
         "second_verification_seconds": 0.0,
+        "initial_model_routing_seconds": 0.0,
+        "second_model_routing_seconds": 0.0,
+        "model_routing_seconds": 0.0,
     }
     warnings: list[str] = []
+
+    try:
+        routing_mode = ModelRoutingMode(model_routing)
+        tier_ceiling = ModelTier(max_model_tier)
+    except ValueError as exc:
+        raise InputError("invalid model routing mode or maximum model tier") from exc
+    started = time.perf_counter()
+    routing_registry = model_registry or ModelRegistry.configured(model_registry_path)
+    routing_policy = ModelRoutingPolicy(routing_registry)
+    initial_routing = routing_policy.select_initial(
+        provider=selected_provider,
+        routing_mode=routing_mode,
+        requested_model=model,
+        max_allowed_tier=tier_ceiling,
+    )
+    routing_policy.assert_allowed(initial_routing)
+    timing["initial_model_routing_seconds"] = _elapsed(started)
+    timing["model_routing_seconds"] = timing["initial_model_routing_seconds"]
+    selected_model = initial_routing.selected_model
 
     started = time.perf_counter()
     layout = discover_repository(repo_path, terraform_dir)
@@ -344,12 +379,15 @@ def diagnose_repository(
     active_request = initial_request
     llm_calls: list[LLMInvocation] = []
     prompt_records: list[tuple[LLMInvocation, PromptParts, DiagnosisRequest]] = []
-    if llm_provider is None:
-        llm_provider = create_llm_provider(selected_provider, selected_model)
+    routing_decisions = [initial_routing]
+    semantic_call_attempts = 0
+    factory = provider_factory or create_llm_provider
+    initial_provider = llm_provider or factory(selected_provider, selected_model)
 
     started = time.perf_counter()
     diagnosis_prompt = build_prompt_parts(initial_request)
-    provider_response = llm_provider.diagnose(initial_request)
+    semantic_call_attempts += 1
+    provider_response = initial_provider.diagnose(initial_request)
     timing["initial_llm_seconds"] = _elapsed(started)
     timing["llm_seconds"] = timing["initial_llm_seconds"]
     diagnosis_invocation = invocation_from_response(
@@ -360,6 +398,7 @@ def diagnose_repository(
         prompt=diagnosis_prompt,
         latency_ms=round(timing["initial_llm_seconds"] * 1000),
         context_level=initial_level,
+        routing_decision=initial_routing,
     )
     llm_calls.append(diagnosis_invocation)
     prompt_records.append((diagnosis_invocation, diagnosis_prompt, initial_request))
@@ -436,6 +475,35 @@ def diagnose_repository(
 
     repair_error: str | None = None
     if second_attempt_reason is not SecondAttemptReason.NONE:
+        started = time.perf_counter()
+        second_routing = routing_policy.select_second(
+            initial=initial_routing,
+            second_attempt_reason=second_attempt_reason,
+        )
+        routing_policy.assert_allowed(second_routing)
+        timing["second_model_routing_seconds"] = _elapsed(started)
+        timing["model_routing_seconds"] = round(
+            timing["initial_model_routing_seconds"]
+            + timing["second_model_routing_seconds"],
+            6,
+        )
+        routing_decisions.append(second_routing)
+        if (
+            llm_provider is not None
+            and second_routing.selected_model == initial_routing.selected_model
+            and second_routing.selected_provider is initial_routing.selected_provider
+        ):
+            second_provider = initial_provider
+        elif provider_factory is not None or llm_provider is None:
+            second_provider = factory(
+                second_routing.selected_provider,
+                second_routing.selected_model,
+            )
+        else:
+            raise ModelRoutingError(
+                "auto routing selected a different model but no provider factory was supplied",
+                code="no_eligible_model",
+            )
         repair_request = RepairRequest(
             original=active_request,
             previous_diagnosis=initial_model,
@@ -450,7 +518,8 @@ def diagnose_repository(
         repair_prompt = build_repair_prompt_parts(repair_request)
         started = time.perf_counter()
         try:
-            repair_response = llm_provider.repair(repair_request)
+            semantic_call_attempts += 1
+            repair_response = second_provider.repair(repair_request)
             second_model = repair_response.diagnosis
             final_model = second_model
         except Exception as exc:
@@ -463,11 +532,12 @@ def diagnose_repository(
             repair_invocation = invocation_from_response(
                 repair_response,
                 provider=selected_provider,
-                requested_model=selected_model,
+                requested_model=second_routing.selected_model,
                 call_type=LLMCallType.REPAIR,
                 prompt=repair_prompt,
                 latency_ms=round(timing["second_llm_seconds"] * 1000),
                 context_level=active_request.context_level,
+                routing_decision=second_routing,
             )
             llm_calls.append(repair_invocation)
             prompt_records.append((repair_invocation, repair_prompt, active_request))
@@ -488,13 +558,22 @@ def diagnose_repository(
             )
             attempts.append(second_attempt)
 
-    assert len(llm_calls) <= 2, "v0.8 permits at most two model calls"
+    assert semantic_call_attempts <= 2, "v0.9 permits at most two semantic model calls"
+    assert len(llm_calls) <= 2, "v0.9 permits at most two validated model responses"
+    for invocation, routing_decision in zip(llm_calls, routing_decisions, strict=False):
+        assert invocation.provider is routing_decision.selected_provider
+        assert invocation.requested_model == routing_decision.selected_model
     same_model = all(
-        call.provider == diagnosis_invocation.provider
-        and call.requested_model == diagnosis_invocation.requested_model
-        for call in llm_calls
+        item.selected_provider is initial_routing.selected_provider
+        and item.selected_model == initial_routing.selected_model
+        for item in routing_decisions
     )
-    assert same_model, "progressive calls must use the same provider and requested model"
+    if routing_mode is ModelRoutingMode.FIXED:
+        assert same_model, "fixed routing must preserve the requested model"
+    else:
+        for routing_decision in routing_decisions:
+            routing_policy.assert_allowed(routing_decision)
+            assert routing_decision.selected_provider is selected_provider
 
     for attempt in attempts:
         warnings.extend(
@@ -559,6 +638,25 @@ def diagnose_repository(
         escalation_input_tokens=llm_usage.escalation_input_tokens,
         total_input_tokens=llm_usage.input_tokens,
     )
+    final_routing = routing_decisions[-1]
+    tier_escalated = bool(
+        initial_routing.selected_tier is not None
+        and final_routing.selected_tier is not None
+        and TIER_ORDER[final_routing.selected_tier]
+        > TIER_ORDER[initial_routing.selected_tier]
+    )
+    model_progression = ModelProgression(
+        routing_mode=routing_mode,
+        initial_model=initial_routing.selected_model,
+        final_model=final_routing.selected_model,
+        initial_tier=initial_routing.selected_tier,
+        final_tier=final_routing.selected_tier,
+        model_escalated=final_routing.selected_model != initial_routing.selected_model,
+        tier_escalated=tier_escalated,
+        max_allowed_tier=tier_ceiling,
+        models_used=[item.selected_model for item in routing_decisions],
+        decisions=routing_decisions,
+    )
 
     timing["total_seconds"] = _elapsed(total_start)
     return ResultDocument(
@@ -587,5 +685,6 @@ def diagnose_repository(
         schema_slice_manifest=[item.manifest for item in schema_slices],
         schema_optimization=schema_optimization,
         context_progression=progression,
+        model_progression=model_progression,
         warnings=warnings,
     )

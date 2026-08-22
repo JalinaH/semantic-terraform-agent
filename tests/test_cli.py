@@ -55,6 +55,37 @@ def test_cli_defaults_to_one_repair_attempt() -> None:
     assert args.model is None
     assert args.context_strategy == "deterministic-minimal-v1"
     assert args.schema_strategy == "sliced"
+    assert args.model_routing == "fixed"
+    assert args.max_model_tier == "premium"
+    assert args.model_registry is None
+
+
+def test_cli_accepts_auto_routing_without_explicit_openrouter_model() -> None:
+    args = build_parser().parse_args(
+        [
+            "diagnose",
+            "--repo-path",
+            ".",
+            "--terraform-dir",
+            "infrastructure",
+            "--log-file",
+            "plan.log",
+            "--provider",
+            "openrouter",
+            "--model-routing",
+            "auto",
+            "--max-model-tier",
+            "free",
+            "--model-registry",
+            "models.json",
+            "--output",
+            "result.json",
+        ]
+    )
+    assert args.model is None
+    assert args.model_routing == "auto"
+    assert args.max_model_tier == "free"
+    assert args.model_registry == Path("models.json")
 
 
 def test_cli_accepts_hidden_full_schema_evaluation_strategy() -> None:
@@ -180,6 +211,40 @@ def test_openrouter_cli_error_is_categorized_without_gemini_fallback(
     payload = output.read_text()
     assert '"error_code": "authentication_failed"' in payload
     assert "must-not-be-used" not in payload
+
+
+def test_auto_routing_error_is_machine_readable_without_provider_call(
+    tmp_path: Path, capsys
+) -> None:
+    registry = tmp_path / "models.json"
+    registry.write_text('{"models": []}', encoding="utf-8")
+    output = tmp_path / "result.json"
+
+    exit_code = main(
+        [
+            "diagnose",
+            "--repo-path",
+            str(tmp_path / "missing-repository"),
+            "--terraform-dir",
+            "infrastructure",
+            "--log-file",
+            str(tmp_path / "missing.log"),
+            "--provider",
+            "openrouter",
+            "--model-routing",
+            "auto",
+            "--max-model-tier",
+            "free",
+            "--model-registry",
+            str(registry),
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert exit_code == 2
+    assert '"routing_error_code": "no_eligible_model"' in output.read_text()
+    assert "OPENROUTER_API_KEY" not in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("stage", ["validate", "plan"])

@@ -14,6 +14,7 @@ from semantic_terraform_agent.models import (
     LLMInvocation,
     LLMProviderName,
     LLMUsage,
+    ModelRoutingDecision,
     ProviderResponse,
     TokenUsage,
 )
@@ -29,10 +30,24 @@ def invocation_from_response(
     prompt: PromptParts,
     latency_ms: int,
     context_level: ContextLevel | None = None,
+    routing_decision: ModelRoutingDecision | None = None,
 ) -> LLMInvocation:
     """Use provider telemetry, or adapt a legacy provider response safely."""
     if response.llm_call is not None:
-        return response.llm_call.model_copy(update={"context_level": context_level})
+        return response.llm_call.model_copy(
+            update={
+                "context_level": context_level,
+                "routing_tier": (
+                    routing_decision.selected_tier if routing_decision else None
+                ),
+                "routing_reason": (
+                    routing_decision.reason_code if routing_decision else None
+                ),
+                "call_number": (
+                    routing_decision.call_number if routing_decision else None
+                ),
+            }
+        )
     return LLMInvocation(
         provider=provider,
         requested_model=requested_model,
@@ -42,6 +57,9 @@ def invocation_from_response(
         latency_ms=latency_ms,
         call_type=call_type,
         context_level=context_level,
+        routing_tier=(routing_decision.selected_tier if routing_decision else None),
+        routing_reason=(routing_decision.reason_code if routing_decision else None),
+        call_number=(routing_decision.call_number if routing_decision else None),
         prompt_characters=prompt.prompt_characters,
         system_prompt_characters=len(prompt.system),
         user_prompt_characters=len(prompt.user),

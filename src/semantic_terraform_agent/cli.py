@@ -12,6 +12,7 @@ from semantic_terraform_agent.config import (
     DEFAULT_GEMINI_MODEL,
     AgentError,
     InputError,
+    ModelRoutingError,
     ProviderError,
     provider_names,
 )
@@ -40,9 +41,26 @@ def build_parser() -> argparse.ArgumentParser:
     diagnose.add_argument(
         "--model",
         help=(
-            "provider model ID; defaults to gemini-2.5-flash for Gemini and is "
-            "required for OpenRouter"
+            "provider model ID; fixed Gemini defaults to gemini-2.5-flash, fixed "
+            "OpenRouter requires it, and auto routing may select it from the registry"
         ),
+    )
+    diagnose.add_argument(
+        "--model-routing",
+        choices=("fixed", "auto"),
+        default="fixed",
+        help="fixed preserves the requested model; auto uses the local model registry",
+    )
+    diagnose.add_argument(
+        "--max-model-tier",
+        choices=("free", "economy", "balanced", "premium"),
+        default="premium",
+        help="maximum tier eligible for automatic model routing",
+    )
+    diagnose.add_argument(
+        "--model-registry",
+        type=Path,
+        help="local JSON model registry; environment configuration is used when omitted",
     )
     diagnose.add_argument(
         "--context-mode",
@@ -155,6 +173,25 @@ def _print_summary(result: ResultDocument, output: Path) -> None:
             f"{'yes' if progression.schema_retrieved else 'no'}"
         )
         print(f"  Second attempt:    {progression.second_attempt_reason.value}")
+    model_progression = result.model_progression
+    if model_progression is not None:
+        print("Model routing:")
+        print(f"  Mode:              {model_progression.routing_mode.value}")
+        print(f"  Max tier:          {model_progression.max_allowed_tier.value}")
+        print(f"  Initial model:     {model_progression.initial_model}")
+        print(
+            "  Initial tier:      "
+            f"{model_progression.initial_tier.value if model_progression.initial_tier else 'unregistered'}"
+        )
+        print(f"  Final model:       {model_progression.final_model}")
+        print(
+            "  Final tier:        "
+            f"{model_progression.final_tier.value if model_progression.final_tier else 'unregistered'}"
+        )
+        print(
+            "  Model escalated:   "
+            f"{'yes' if model_progression.model_escalated else 'no'}"
+        )
     print("Final verification:")
     print(f"  {diagnosis.verification.status.replace('_', ' ').upper()}")
     if diagnosis.verification.reason:
@@ -308,9 +345,20 @@ def main(argv: list[str] | None = None) -> int:
     if args.command != "diagnose":
         parser.error("a command is required")
     try:
-        if args.model is None and args.provider != "gemini":
+        if (
+            args.model is None
+            and args.provider != "gemini"
+            and args.model_routing == "fixed"
+        ):
             raise InputError("--model is required when --provider openrouter is selected")
-        model = args.model or DEFAULT_GEMINI_MODEL
+        model = (
+            args.model
+            or (
+                DEFAULT_GEMINI_MODEL
+                if args.provider == "gemini" and args.model_routing == "fixed"
+                else None
+            )
+        )
         result = diagnose_repository(
             repo_path=args.repo_path,
             terraform_dir=args.terraform_dir,
@@ -324,6 +372,9 @@ def main(argv: list[str] | None = None) -> int:
             failed_stage=args.failed_stage,
             context_strategy=args.context_strategy,
             schema_strategy=args.schema_strategy,
+            model_routing=args.model_routing,
+            max_model_tier=args.max_model_tier,
+            model_registry_path=args.model_registry,
         )
         _write_result(args.output, result)
     except (AgentError, OSError, ValidationError, ValueError) as exc:
@@ -331,6 +382,9 @@ def main(argv: list[str] | None = None) -> int:
             status="error",
             error=str(exc),
             error_code=exc.category if isinstance(exc, ProviderError) else None,
+            routing_error_code=(
+                exc.code if isinstance(exc, ModelRoutingError) else None
+            ),
             warnings=[],
         )
         try:

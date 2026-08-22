@@ -36,13 +36,28 @@ on:
         required: false
         default: gemini-3.6-flash
         type: string
+      model_routing:
+        description: Model routing policy (fixed or auto)
+        required: false
+        default: fixed
+        type: string
+      max_model_tier:
+        description: Maximum tier allowed for automatic model routing
+        required: false
+        default: premium
+        type: string
+      model_registry_path:
+        description: Optional caller-repository-relative model registry JSON path
+        required: false
+        default: ""
+        type: string
       context_mode:
         description: Agent context mode
         required: false
         default: auto
         type: string
       max_repair_attempts:
-        description: Maximum bounded repair attempts (0 or 1)
+        description: Maximum bounded second model opportunities (0 or 1)
         required: false
         default: 1
         type: number
@@ -92,6 +107,9 @@ jobs:
       FAILED_STAGE: ${{ inputs.failed_stage }}
       PROVIDER: ${{ inputs.provider }}
       MODEL: ${{ inputs.model }}
+      MODEL_ROUTING: ${{ inputs.model_routing }}
+      MAX_MODEL_TIER: ${{ inputs.max_model_tier }}
+      MODEL_REGISTRY_PATH_INPUT: ${{ inputs.model_registry_path }}
       CONTEXT_MODE: ${{ inputs.context_mode }}
       MAX_REPAIR_ATTEMPTS: ${{ inputs.max_repair_attempts }}
       AWS_REGION: ${{ inputs.aws_region }}
@@ -159,6 +177,14 @@ jobs:
             lightweight|schema-aware|auto) ;;
             *) echo "::error::Invalid context_mode: ${CONTEXT_MODE}"; exit 1 ;;
           esac
+          case "${MODEL_ROUTING}" in
+            fixed|auto) ;;
+            *) echo "::error::Invalid model_routing: ${MODEL_ROUTING}"; exit 1 ;;
+          esac
+          case "${MAX_MODEL_TIER}" in
+            free|economy|balanced|premium) ;;
+            *) echo "::error::Invalid max_model_tier: ${MAX_MODEL_TIER}"; exit 1 ;;
+          esac
           case "${FAILED_STAGE}" in
             init|fmt|validate|plan|apply|unknown) ;;
             *) echo "::error::Invalid failed_stage: ${FAILED_STAGE}"; exit 1 ;;
@@ -177,7 +203,7 @@ jobs:
               fi
               ;;
             *)
-              echo "::error::Unsupported provider in version 0.8.0: ${PROVIDER}"
+              echo "::error::Unsupported provider in version 0.9.0: ${PROVIDER}"
               exit 1
               ;;
           esac
@@ -230,6 +256,33 @@ jobs:
             exit 1
           fi
           echo "TERRAFORM_DIR=${resolved_terraform_dir}" >> "${GITHUB_ENV}"
+          if [[ -n "${MODEL_REGISTRY_PATH_INPUT}" ]]; then
+            if [[ "${MODEL_REGISTRY_PATH_INPUT}" == /* \
+              || "${MODEL_REGISTRY_PATH_INPUT}" == *\\* \
+              || "${MODEL_REGISTRY_PATH_INPUT}" == *$'\n'* \
+              || "${MODEL_REGISTRY_PATH_INPUT}" == *$'\r'* ]]; then
+              echo "::error::model_registry_path must be repository-relative POSIX path."
+              exit 1
+            fi
+            IFS='/' read -r -a registry_parts <<< "${MODEL_REGISTRY_PATH_INPUT}"
+            for part in "${registry_parts[@]}"; do
+              if [[ "${part}" == ".." ]]; then
+                echo "::error::model_registry_path must not contain traversal segments."
+                exit 1
+              fi
+            done
+            registry_candidate="${GITHUB_WORKSPACE}/${MODEL_REGISTRY_PATH_INPUT}"
+            if [[ ! -f "${registry_candidate}" ]]; then
+              echo "::error::Model registry is not a file: ${MODEL_REGISTRY_PATH_INPUT}"
+              exit 1
+            fi
+            registry_path="$(realpath -e "${registry_candidate}")"
+            case "${registry_path}" in
+              "${repository_root}"/*) ;;
+              *) echo "::error::model_registry_path resolves outside the caller repository."; exit 1 ;;
+            esac
+            echo "MODEL_REGISTRY_PATH=${registry_path}" >> "${GITHUB_ENV}"
+          fi
 
       - name: Download Terraform failure artifact
         uses: actions/download-artifact@v7
@@ -342,12 +395,19 @@ jobs:
             --log-file "${FAILURE_LOG}"
             --failed-stage "${FAILED_STAGE}"
             --provider "${PROVIDER}"
-            --model "${MODEL}"
+            --model-routing "${MODEL_ROUTING}"
+            --max-model-tier "${MAX_MODEL_TIER}"
             --context-mode "${CONTEXT_MODE}"
             --verify-patch
             --max-repair-attempts "${MAX_REPAIR_ATTEMPTS}"
             --output "${RESULT_PATH}"
           )
+          if [[ -n "${MODEL}" ]]; then
+            arguments+=(--model "${MODEL}")
+          fi
+          if [[ -n "${MODEL_REGISTRY_PATH:-}" ]]; then
+            arguments+=(--model-registry "${MODEL_REGISTRY_PATH}")
+          fi
           if [[ -n "${DIFF_FILE:-}" ]]; then
             arguments+=(--diff-file "${DIFF_FILE}")
           fi
