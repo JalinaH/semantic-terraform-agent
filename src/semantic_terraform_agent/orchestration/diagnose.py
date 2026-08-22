@@ -19,7 +19,7 @@ from semantic_terraform_agent.config import (
     parse_provider_name,
     validate_model_id,
 )
-from semantic_terraform_agent.context import ContextBuilder
+from semantic_terraform_agent.context import ContextBuilder, slice_schema_records
 from semantic_terraform_agent.context.builder import (
     minimal_diff,
     minimal_sources,
@@ -170,9 +170,10 @@ def diagnose_repository(
     context_strategy: Literal[
         "deterministic-minimal-v1", "legacy-v0.5"
     ] = "deterministic-minimal-v1",
+    schema_strategy: Literal["sliced", "full"] = "sliced",
 ) -> ResultDocument:
     if max_repair_attempts not in (0, 1):
-        raise InputError("max_repair_attempts must be 0 or 1 in version 0.6.0")
+        raise InputError("max_repair_attempts must be 0 or 1 in version 0.7.0")
     selected_provider = parse_provider_name(provider_name)
     selected_model = validate_model_id(selected_provider, model)
     total_start = time.perf_counter()
@@ -241,6 +242,22 @@ def diagnose_repository(
     warnings.extend(schema_warnings)
     timing["schema_seconds"] = _elapsed(started)
 
+    started = time.perf_counter()
+    schema_slices, schema_optimization = slice_schema_records(
+        terraform_info.schemas,
+        failure=failure,
+        diagnosis_context=diagnosis_context,
+        strategy=schema_strategy,
+    )
+    timing["schema_slice_seconds"] = _elapsed(started)
+    if schema_strategy == "sliced":
+        warnings.extend(
+            "Provider schema slicing used full-schema fallback for "
+            f"{item.resource_type}: {item.telemetry.fallback_reason}."
+            for item in schema_slices
+            if item.telemetry.strategy == "full_schema_fallback"
+        )
+
     request = DiagnosisRequest(
         failure=failure,
         resources=resources,
@@ -250,6 +267,9 @@ def diagnose_repository(
         schemas=terraform_info.schemas,
         terraform_version=terraform_info.version,
         diagnosis_context=diagnosis_context,
+        schema_slices=schema_slices,
+        schema_optimization=schema_optimization,
+        schema_strategy=schema_strategy,
     )
     llm_calls: list[LLMInvocation] = []
     prompt_records: list[tuple[LLMInvocation, PromptParts]] = []
@@ -374,5 +394,7 @@ def diagnose_repository(
         context_optimization=(
             diagnosis_context.optimization if diagnosis_context else None
         ),
+        schema_slice_manifest=[item.manifest for item in schema_slices],
+        schema_optimization=schema_optimization,
         warnings=warnings,
     )

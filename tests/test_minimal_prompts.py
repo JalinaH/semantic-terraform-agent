@@ -20,6 +20,7 @@ from semantic_terraform_agent.models import (
     VerificationCommand,
     VerificationCommands,
 )
+from semantic_terraform_agent.context.schema_slicer import slice_schema_records
 from semantic_terraform_agent.reasoning.prompts import (
     build_prompt_parts,
     build_repair_prompt_parts,
@@ -183,6 +184,46 @@ def _diagnosis() -> ModelDiagnosis:
     )
 
 
+def _sliced_request():
+    request = _request(schema_aware=True)
+    full_schema = {
+        "version": 1,
+        "block": {
+            "attributes": {
+                "mode": {"type": "string", "required": True},
+                "large_unrelated": {
+                    "type": "string",
+                    "optional": True,
+                    "description": "FULL_SCHEMA_ONLY " * 200,
+                },
+            }
+        },
+    }
+    schemas = [
+        SchemaRecord(
+            resource_type="example_widget",
+            provider_source="registry.terraform.io/example/example",
+            provider_version="1.2.3",
+            extraction_status="ok",
+            schema=full_schema,
+        )
+    ]
+    slices, optimization = slice_schema_records(
+        schemas,
+        failure=request.failure,
+        diagnosis_context=request.diagnosis_context,
+        strategy="sliced",
+    )
+    return request.model_copy(
+        update={
+            "schemas": schemas,
+            "schema_slices": slices,
+            "schema_optimization": optimization,
+            "schema_strategy": "sliced",
+        }
+    )
+
+
 def test_minimal_prompt_has_exact_deduplicated_sections() -> None:
     prompt = build_prompt_parts(_request())
     assert prompt.user.count("Unique diagnostic summary") == 1
@@ -211,6 +252,18 @@ def test_schema_aware_prompt_keeps_existing_resource_schema() -> None:
     assert prompt.section_characters["provider_schema"] > 0
     assert "registry.terraform.io/example/example" in prompt.user
     assert '"mode":{}' in prompt.user
+
+
+def test_schema_aware_prompt_includes_only_the_slice_once() -> None:
+    request = _sliced_request()
+    prompt = build_prompt_parts(request)
+
+    assert prompt.user.count("RELEVANT PROVIDER SCHEMA") == 1
+    assert '"mode":{"required":true,"type":"string"}' in prompt.user
+    assert "FULL_SCHEMA_ONLY" not in prompt.user
+    assert "large_unrelated" not in prompt.user
+    assert "selection_reasons" not in prompt.user
+    assert prompt.section_characters["provider_schema"] > 0
 
 
 def test_repair_prompt_reuses_minimal_context_without_original_prompt() -> None:
@@ -245,6 +298,38 @@ def test_repair_prompt_reuses_minimal_context_without_original_prompt() -> None:
     assert "terraform plan" in repair.user
     assert repair.section_characters["verification_evidence"] > 0
     assert repair.section_characters["provider_schema"] > 0
+
+
+def test_repair_prompt_reuses_the_same_slice_without_full_schema() -> None:
+    request = _sliced_request()
+    diagnosis = _diagnosis()
+    attempt = VerificationAttempt(
+        attempt=1,
+        patch=diagnosis.suggested_patch,
+        status="failed",
+        failed_stage="plan",
+        commands=VerificationCommands(
+            plan=VerificationCommand(
+                command=["terraform", "plan"],
+                status="failed",
+                exit_code=1,
+                stderr='Attribute "mode" remains invalid.',
+            )
+        ),
+        temporary_copy_cleaned=True,
+    )
+    repair = build_repair_prompt_parts(
+        RepairRequest(
+            original=request,
+            previous_diagnosis=diagnosis,
+            failed_attempt=attempt,
+        )
+    )
+
+    assert repair.user.count("RELEVANT PROVIDER SCHEMA") == 1
+    assert '"mode":{"required":true,"type":"string"}' in repair.user
+    assert "FULL_SCHEMA_ONLY" not in repair.user
+    assert request.schema_optimization.repair_expanded is False
 
 
 def test_prompt_section_telemetry_tracks_diagnosis_and_repair_separately() -> None:
@@ -312,3 +397,29 @@ def test_prompt_section_telemetry_tracks_diagnosis_and_repair_separately() -> No
         LLMCallType.REPAIR,
     ]
     assert telemetry.calls[1].sections["verification_evidence"].characters > 0
+
+
+def test_schema_section_telemetry_separates_raw_schema_and_rendered_characters() -> None:
+    request = _sliced_request()
+    prompt = build_prompt_parts(request)
+    invocation = LLMInvocation(
+        provider=LLMProviderName.OPENROUTER,
+        requested_model="example/model:free",
+        latency_ms=10,
+        call_type=LLMCallType.DIAGNOSIS,
+        prompt_characters=prompt.prompt_characters,
+        system_prompt_characters=len(prompt.system),
+        user_prompt_characters=len(prompt.user),
+    )
+    telemetry = build_context_telemetry(request, [(invocation, prompt)])
+    section = telemetry.sections["provider_schema"]
+
+    assert section.characters == prompt.section_characters["provider_schema"]
+    assert section.full_available_characters == (
+        request.schema_optimization.full_schema_characters
+    )
+    assert section.selected_schema_characters == (
+        request.schema_optimization.selected_schema_characters
+    )
+    assert section.reduction_ratio == request.schema_optimization.reduction_ratio
+    assert request.schema_optimization.input_token_reduction_ratio is None

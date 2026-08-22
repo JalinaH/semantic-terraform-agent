@@ -2,16 +2,20 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from semantic_terraform_agent.cli import _print_summary
 from semantic_terraform_agent.config import ProviderError
 from semantic_terraform_agent.models import (
     ModelDiagnosis,
     ProviderResponse,
     TokenUsage,
+    SchemaRecord,
+    TerraformInfo,
     VerificationAttempt,
     VerificationCommand,
     VerificationCommands,
 )
 from semantic_terraform_agent.orchestration.diagnose import diagnose_repository
+from semantic_terraform_agent.reasoning.prompts import build_prompt_parts
 from semantic_terraform_agent.terraform.verification import verify_candidate_patch
 
 
@@ -133,7 +137,7 @@ def run_diagnosis(
 
 
 def test_successful_first_attempt_has_no_repair(
-    terraform_repo: Path, failure_log: Path, diff_file: Path
+    terraform_repo: Path, failure_log: Path, diff_file: Path, capsys
 ) -> None:
     provider = FakeProvider()
 
@@ -164,6 +168,102 @@ def test_successful_first_attempt_has_no_repair(
     assert result.context_optimization.strategy == "deterministic_minimal_v1"
     assert result.context_optimization.input_token_reduction_ratio is None
     assert "context_build_seconds" in result.timing
+    assert "schema_slice_seconds" in result.timing
+    assert result.schema_optimization is None
+    assert result.schema_slice_manifest == []
+    assert result.context_telemetry.sections["provider_schema"].characters == 0
+    _print_summary(result, Path("result.json"))
+    assert "Provider schema:     not used" in capsys.readouterr().out
+
+
+def test_schema_aware_orchestration_slices_locally_and_persists_only_manifest(
+    terraform_repo: Path,
+    failure_log: Path,
+    diff_file: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    provider = FakeProvider()
+    full_schema = {
+        "version": 1,
+        "block": {
+            "attributes": {
+                "mode": {"type": "string", "required": True},
+                "unrelated": {
+                    "type": "string",
+                    "optional": True,
+                    "description": "x" * 1_000 + " FULL_SCHEMA_ONLY",
+                },
+            }
+        },
+    }
+
+    def fake_inspect(layout, resource_types, *, enabled):
+        assert enabled is True
+        assert resource_types == ["example_widget"]
+        return (
+            TerraformInfo(
+                version="1.9.0",
+                schema_extraction_status="ok",
+                schemas=[
+                    SchemaRecord(
+                        resource_type="example_widget",
+                        provider_source="registry.terraform.io/example/example",
+                        provider_version="1.2.3",
+                        extraction_status="ok",
+                        schema=full_schema,
+                    )
+                ],
+            ),
+            [],
+        )
+
+    monkeypatch.setattr(
+        "semantic_terraform_agent.orchestration.diagnose.inspect_schemas",
+        fake_inspect,
+    )
+
+    def verifier(patch, layout, *, attempt):
+        return attempt_result(patch, attempt, status="verified")
+
+    result = diagnose_repository(
+        repo_path=terraform_repo,
+        terraform_dir=Path("infrastructure"),
+        log_file=failure_log,
+        diff_file=diff_file,
+        provider_name="gemini",
+        model="fake",
+        context_mode="schema-aware",
+        llm_provider=provider,
+        patch_verifier=verifier,
+    )
+
+    assert provider.request.schema_strategy == "sliced"
+    assert len(provider.request.schema_slices) == 1
+    assert provider.request.schema_slices[0].manifest.selected_paths == [
+        "block.attributes.mode"
+    ]
+    prompt = build_prompt_parts(provider.request)
+    assert "FULL_SCHEMA_ONLY" not in prompt.user
+    assert '"mode":{"required":true,"type":"string"}' in prompt.user
+    assert result.terraform.schemas[0].resource_schema == full_schema
+    assert result.schema_slice_manifest == [
+        provider.request.schema_slices[0].manifest
+    ]
+    assert result.schema_optimization.selected_path_count == 1
+    assert result.schema_optimization.input_token_reduction_ratio is None
+    assert "schema_slice_seconds" in result.timing
+    schema_section = result.context_telemetry.sections["provider_schema"]
+    assert schema_section.full_available_characters > (
+        schema_section.selected_schema_characters
+    )
+    assert result.model_dump_json(by_alias=True).count("FULL_SCHEMA_ONLY") == 1
+    _print_summary(result, Path("result.json"))
+    rendered = capsys.readouterr().out
+    assert "Schema strategy:     deterministic_schema_slice_v1" in rendered
+    assert "Provider schema:" in rendered
+    assert "Selected paths:      1" in rendered
+    assert "Schema fallback:     no" in rendered
 
 
 def test_explicit_failed_stage_overrides_log_inference(

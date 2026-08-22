@@ -54,6 +54,26 @@ def test_cli_defaults_to_one_repair_attempt() -> None:
     assert args.provider == "gemini"
     assert args.model is None
     assert args.context_strategy == "deterministic-minimal-v1"
+    assert args.schema_strategy == "sliced"
+
+
+def test_cli_accepts_hidden_full_schema_evaluation_strategy() -> None:
+    args = build_parser().parse_args(
+        [
+            "diagnose",
+            "--repo-path",
+            ".",
+            "--terraform-dir",
+            "infrastructure",
+            "--log-file",
+            "plan.log",
+            "--schema-strategy",
+            "full",
+            "--output",
+            "result.json",
+        ]
+    )
+    assert args.schema_strategy == "full"
 
 
 def test_cli_accepts_openrouter_and_dynamic_free_model() -> None:

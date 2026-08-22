@@ -12,12 +12,13 @@ implementation.
 
 ## Status and scope
 
-Version `0.6.0` adds a deterministic minimal-context engine. It substantially reduces
-model input by selecting exact Terraform diagnostics, relevant changes, affected blocks,
-and only direct supporting definitions. Critical HCL is preserved exactly; no LLM-based
-summarization, lossy prompt compression, model escalation, or schema slicing is used.
-OpenRouter/Gemini support, bounded diagnosis and repair, verification, telemetry, and the
-reusable GitHub Actions interface remain compatible:
+Version `0.7.0` adds deterministic provider-schema slicing on top of the v0.6 minimal
+Terraform context engine. Schema-aware calls now select exact diagnostic and changed
+fields, preserve relevant nested structure and metadata, and keep complete schemas out of
+model prompts. Critical HCL and selected schema definitions remain exact; no LLM-based
+selection, lossy prompt compression, model escalation, or caching is used. OpenRouter/
+Gemini support, bounded diagnosis and repair, verification, telemetry, and the reusable
+GitHub Actions interface remain compatible:
 
 ```text
 repository + failure log
@@ -28,6 +29,7 @@ repository + failure log
   -> direct var/local/data/resource definitions (depth 1)
   -> deterministic context selection
   -> selective schema inspection (when selected)
+  -> deterministic schema indexing, path selection, and structural pruning
   -> provider-neutral Gemini or OpenRouter structured diagnosis
   -> isolated patch application + fmt/init/validate/plan
   -> at most one evidence-driven repair + fresh verification
@@ -87,14 +89,14 @@ identify a resource.
 `--context-mode` accepts:
 
 - `lightweight`: error, relevant Terraform source, and Git diff only.
-- `schema-aware`: adds matched resource schemas and provider metadata.
+- `schema-aware`: adds deterministic slices of matched resource schemas and provider metadata.
 - `auto`: applies the deterministic policy described below.
 
 The default Gemini model is `gemini-2.5-flash`. OpenRouter requires an explicit dynamic
 model ID in `provider/model` form; the agent does not maintain a fixed model allowlist.
 Patch verification is enabled by default. Use `--no-verify-patch` to record a
 deliberately skipped verification in environments where local commands must not run.
-`--max-repair-attempts` accepts only `0` or `1` in version 0.6.0 and defaults to `1`.
+`--max-repair-attempts` accepts only `0` or `1` in version 0.7.0 and defaults to `1`.
 Use `0` to verify the initial patch without asking the model for a repair.
 
 `--failed-stage` optionally records the caller-known stage as `init`, `fmt`, `validate`,
@@ -198,9 +200,15 @@ whether candidate selection was ambiguous. It does not duplicate source. The sep
 discoverable in the selected working directory and compares that with exact selected HCL.
 Its token-reduction ratio stays `null` unless a comparable provider-reported baseline is
 available; character reduction is never presented as token reduction.
-`timing.context_build_seconds` measures local selection time. The CLI prints available
-versus included Terraform files/resources and source-character reduction, but makes no
-token-saving claim without a comparison run.
+For schema-aware calls, the `provider_schema` section also records raw full-available and
+selected-schema character counts separately from its rendered section characters.
+`schema_slice_manifest` contains selected paths, per-path reasons, unmatched diagnostic
+terms, description truncations, and dropped paths without schema definitions.
+`schema_optimization` aggregates full/selected schema characters, paths, fallback state,
+and a null token-reduction ratio. `timing.context_build_seconds` and
+`timing.schema_slice_seconds` measure the two local deterministic stages. The CLI prints
+Terraform-source and provider-schema character reductions, but makes no token-saving claim
+without a comparison run.
 
 An abbreviated result is:
 
@@ -261,7 +269,9 @@ An abbreviated result is:
     "reduction_ratio": 0.82967,
     "character_reduction_ratio": 0.82967,
     "input_token_reduction_ratio": null
-  }
+  },
+  "schema_slice_manifest": [],
+  "schema_optimization": null
 }
 ```
 
@@ -299,7 +309,7 @@ When the caller supplies `--failed-stage`, that explicit value replaces the infe
 
 Unstructured or malformed logs produce a conservative fallback rather than an invented
 resource. The entire caller-supplied log is preserved in `failure.original_log`, but the
-normal v0.6 prompt sends the bounded normalized diagnostic rather than duplicating the raw
+normal v0.7 prompt sends the bounded normalized diagnostic rather than duplicating the raw
 log. The original log remains in `failure.original_log` for backward compatibility and is
 not copied into context telemetry or the context manifest.
 
@@ -351,8 +361,9 @@ Soft limits independently bound the diagnostic, diff, affected block, supporting
 and total selected context. Packing drops lower-priority material first. Oversized HCL is
 reduced only at line boundaries around the diagnostic/changed location and marked with a
 stable truncation reason; it is never summarized or rewritten. Schema-aware and auto modes
-use this same minimal Terraform context and then append the existing complete extracted
-resource schema. Provider schema slicing is deliberately deferred to v0.7.
+use this same minimal Terraform context. When schema-aware mode is selected, the context
+is paired with the deterministic schema slice described below rather than the complete
+resource schema.
 
 ## Selective schema inspection
 
@@ -367,11 +378,28 @@ terraform init -backend=false -input=false -no-color
 terraform providers schema -json
 ```
 
-The full schema JSON exists only in process memory long enough to locate candidate
-resource types. The prompt receives only matching `resource_schemas` entries plus their
-provider source and lock-file version. If there are no candidate types, the agent does
-not fall back to sending the entire provider schema. Missing Terraform, failed init,
-unknown resource types, invalid JSON, and partial extraction are recorded explicitly.
+The full schema JSON stays local to the agent while `SchemaSlicer` indexes each matched
+resource schema once. It maps exact keys and nested HCL paths to stable paths such as
+`block.attributes.type` and
+`block.block_types.rule.block.attributes.name`. Selection uses, in order, exact diagnostic
+fields, changed attributes, affected expressions, explicit nested blocks, required
+siblings, and bounded source-attribute fallback. Dynamic values are not fuzzy-matched to
+schema paths. Parent `nesting_mode`, `min_items`, `max_items`, and complete selected field
+metadata are preserved.
+
+The defaults allow at most 32 selected paths, nested depth four, 8,000 compact schema JSON
+characters, and 400 description characters per selected field. Descriptions stop at a
+deterministic sentence/word boundary; JSON is never cut mid-structure. Exact diagnostic
+fields are soft-protected and lower-priority paths are dropped first. Unsupported schema
+shapes or cases with no useful source-attribute fallback use the full matched resource
+schema and record `full_schema_fallback` plus a reason.
+
+The model prompt receives only the slice, provider source, and version. For result
+compatibility, the existing `terraform.schemas` field still contains its single full
+matched schema copy; v0.7 does not add a second sliced-schema copy to the persisted result.
+Instead, `schema_slice_manifest` stores paths/reasons only and `schema_optimization`
+stores character counts, reduction, fallback state, and path count. Missing Terraform,
+failed init, unknown resource types, invalid JSON, and partial extraction remain explicit.
 
 Registry/provider download failures can therefore reduce a schema-aware run to the
 available lightweight evidence; they do not modify the source repository.
@@ -530,13 +558,15 @@ Coverage includes discovery, traversal rejection, diff lines, human/JSON/malform
 unknown and multiple resources, indexed/module addresses, exact block and symbol selection,
 multi-file/no-diff/ambiguous fallbacks, deterministic budgets and de-duplication, section
 telemetry, minimal repair prompts, context manifests/optimization math, schema
-compatibility, arbitrary-file deferral, schema selection/missing CLI, all context modes, strict
-provider JSON, OpenRouter request construction, structured-output fallback, categorized
-errors, bounded transport retries, free/unknown cost handling, secret safety, usage
-aggregation, missing API keys, isolated patch application, plan flags/gating, unsafe first
-and second patches, state and `.terraform` exclusion, output redaction, missing Terraform,
-real Git application, complete attempt history, final status mapping, malformed repair,
-and the exact one-repair bound.
+compatibility, exact and changed schema-field selection, nested structural pruning, required
+siblings, description/path/depth budgets, malformed-schema fallback, schema manifests and
+telemetry, arbitrary-file deferral, schema selection/missing CLI, all context modes,
+strict provider JSON, OpenRouter request construction, structured-output fallback,
+categorized errors, bounded transport retries, free/unknown cost handling, secret safety,
+usage aggregation, missing API keys, isolated patch application, plan flags/gating, unsafe
+first and second patches, state and `.terraform` exclusion, output redaction, missing
+Terraform, real Git application, complete attempt history, final status mapping, malformed
+repair, and the exact one-repair bound.
 
 ## v0.5 versus v0.6 context benchmark
 
@@ -571,6 +601,40 @@ The live repository must contain the complete `cases/<case-id>` configurations a
 collected plan logs; the diagnostic packages remain the deterministic context fixtures.
 When AWS credentials are environment variables, allowlist their names with
 `SEMANTIC_TERRAFORM_AGENT_PASSTHROUGH_ENV` as documented by the isolated verifier.
+
+## v0.6 versus v0.7 schema benchmark
+
+The schema comparison forces all three benchmark cases into schema-aware mode, then uses
+the same v0.6 minimal Terraform context with either the complete matched resource schema
+or the v0.7 deterministic slice:
+
+```bash
+python3 scripts/compare_schema_context.py \
+  --benchmark-root ../terraform-failure-benchmarks/diagnostic-packages
+```
+
+It writes JSON, JSONL, and Markdown to the ignored
+`evaluation-results/v0.7-schema-comparison/` directory. The deterministic offline fixture
+currently measures DynamoDB at 8,303→392 schema characters (95.3%), forced-schema EBS at
+2,170→239 (89.0%), and S3 at 11,744→244 (97.9%). Corresponding total prompt-character
+reductions are 73.0%, 40.3%, and 82.1%. These are character measurements, not token or
+correctness claims; provider token, cost, diagnosis, repair, and verification fields stay
+`null` without comparable live results.
+
+Existing result directories can be merged with
+`--v0-6-results DIR --v0-7-results DIR`. A live comparison requires a fixed free model,
+the full benchmark checkout, Terraform/AWS access, and `OPENROUTER_API_KEY`:
+
+```bash
+OPENROUTER_API_KEY='...' python3 scripts/compare_schema_context.py \
+  --benchmark-root ../terraform-failure-benchmarks/diagnostic-packages \
+  --live-repository-root ../terraform-failure-benchmarks \
+  --run-live \
+  --model '<provider>/<fixed-model>:free'
+```
+
+The live path rejects non-`:free` models and runs the same model once with `full` and once
+with `sliced`; provider-reported tokens/cost and verified patch status remain authoritative.
 
 ## Running against the existing benchmark repository
 

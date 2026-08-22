@@ -56,6 +56,12 @@ def build_parser() -> argparse.ArgumentParser:
         help=argparse.SUPPRESS,
     )
     diagnose.add_argument(
+        "--schema-strategy",
+        choices=("sliced", "full"),
+        default="sliced",
+        help=argparse.SUPPRESS,
+    )
+    diagnose.add_argument(
         "--verify-patch",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -179,6 +185,9 @@ def _print_summary(result: ResultDocument, output: Path) -> None:
     )
     optimization = result.context_optimization
     manifest = result.context_manifest
+    schema_optimization = result.schema_optimization
+    if (optimization is not None and manifest is not None) or schema_optimization:
+        print("Context optimization:")
     if optimization is not None and manifest is not None:
         available_files = optimization.available_source_file_count
         selected_files = optimization.selected_source_file_count
@@ -187,8 +196,7 @@ def _print_summary(result: ResultDocument, output: Path) -> None:
         available_characters = optimization.available_source_characters
         selected_characters = optimization.selected_source_characters
         reduction = optimization.character_reduction_ratio
-        print("Context optimization:")
-        print(f"  Strategy:            {optimization.strategy}")
+        print(f"  Source strategy:     {optimization.strategy}")
         print(
             "  Terraform files:     "
             f"{_format_count(available_files)} available / "
@@ -208,10 +216,30 @@ def _print_summary(result: ResultDocument, output: Path) -> None:
         else:
             print("  Source characters:   not comparable")
         print(
-            f"  Reduction:           {reduction:.1%}"
+            f"  Source reduction:    {reduction:.1%}"
             if reduction is not None
-            else "  Reduction:           not comparable"
+            else "  Source reduction:    not comparable"
         )
+    if schema_optimization is not None:
+        print(f"  Schema strategy:     {schema_optimization.strategy}")
+        print(
+            "  Provider schema:     "
+            f"{schema_optimization.full_schema_characters:,} → "
+            f"{schema_optimization.selected_schema_characters:,} characters"
+        )
+        print(
+            f"  Schema reduction:    {schema_optimization.reduction_ratio:.1%}"
+            if schema_optimization.reduction_ratio is not None
+            else "  Schema reduction:    not comparable"
+        )
+        print(f"  Selected paths:      {schema_optimization.selected_path_count}")
+        if schema_optimization.fallback_used:
+            reason = schema_optimization.fallback_reason or "unspecified"
+            print(f"  Schema fallback:     yes ({reason})")
+        else:
+            print("  Schema fallback:     no")
+    elif result.context is not None and result.context.selected_mode == "lightweight":
+        print("  Provider schema:     not used")
     print(f"Result: {output.expanduser().resolve(strict=False)}")
     if result.warnings:
         print(f"Warnings: {len(result.warnings)}")
@@ -277,6 +305,7 @@ def main(argv: list[str] | None = None) -> int:
             max_repair_attempts=args.max_repair_attempts,
             failed_stage=args.failed_stage,
             context_strategy=args.context_strategy,
+            schema_strategy=args.schema_strategy,
         )
         _write_result(args.output, result)
     except (AgentError, OSError, ValidationError, ValueError) as exc:

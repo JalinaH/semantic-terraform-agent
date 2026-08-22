@@ -167,6 +167,69 @@ class DiagnosisContext(StrictModel):
     selected_context_characters: int = Field(ge=0)
 
 
+class SchemaSliceTelemetry(StrictModel):
+    strategy: Literal[
+        "deterministic_schema_slice_v1",
+        "full_schema_fallback",
+        "full_schema_evaluation",
+    ]
+    full_schema_characters: int = Field(ge=0)
+    selected_schema_characters: int = Field(ge=0)
+    characters_avoided: int = Field(ge=0)
+    reduction_ratio: float | None = Field(default=None, ge=0.0, le=1.0)
+    character_reduction_ratio: float | None = Field(
+        default=None, ge=0.0, le=1.0
+    )
+    input_token_reduction_ratio: float | None = Field(
+        default=None, ge=0.0, le=1.0
+    )
+    selected_path_count: int = Field(default=0, ge=0)
+    fallback_used: bool = False
+    fallback_reason: str | None = None
+    description_truncated_count: int = Field(default=0, ge=0)
+    dropped_path_count: int = Field(default=0, ge=0)
+    budget_exceeded: bool = False
+
+
+class SchemaSliceManifest(StrictModel):
+    resource_type: str
+    provider_source: str | None = None
+    provider_version: str | None = None
+    selected_paths: list[str] = Field(default_factory=list)
+    selection_reasons: dict[str, list[str]] = Field(default_factory=dict)
+    unmatched_terms: list[str] = Field(default_factory=list)
+    description_truncated_paths: list[str] = Field(default_factory=list)
+    dropped_paths: list[str] = Field(default_factory=list)
+
+
+class SchemaSlice(StrictModel):
+    resource_type: str
+    provider_source: str | None = None
+    provider_version: str | None = None
+    selected_schema: dict = Field(alias="schema")
+    manifest: SchemaSliceManifest
+    telemetry: SchemaSliceTelemetry
+
+
+class SchemaOptimization(StrictModel):
+    strategy: str
+    full_schema_characters: int = Field(ge=0)
+    selected_schema_characters: int = Field(ge=0)
+    characters_avoided: int = Field(ge=0)
+    reduction_ratio: float | None = Field(default=None, ge=0.0, le=1.0)
+    character_reduction_ratio: float | None = Field(
+        default=None, ge=0.0, le=1.0
+    )
+    input_token_reduction_ratio: float | None = Field(
+        default=None, ge=0.0, le=1.0
+    )
+    selected_path_count: int = Field(default=0, ge=0)
+    schema_count: int = Field(default=0, ge=0)
+    fallback_used: bool = False
+    fallback_reason: str | None = None
+    repair_expanded: bool = False
+
+
 class EvidenceItem(StrictModel):
     source: Literal["terraform_error", "terraform_source", "git_diff", "provider_schema"]
     detail: str
@@ -313,6 +376,9 @@ class ContextTelemetry(StrictModel):
 
 class ContextSectionTelemetry(StrictModel):
     characters: int = Field(ge=0)
+    full_available_characters: int | None = Field(default=None, ge=0)
+    selected_schema_characters: int | None = Field(default=None, ge=0)
+    reduction_ratio: float | None = Field(default=None, ge=0.0, le=1.0)
 
 
 class ContextCallTelemetry(StrictModel):
@@ -333,6 +399,9 @@ class DiagnosisRequest(StrictModel):
     schemas: list[SchemaRecord]
     terraform_version: str | None = None
     diagnosis_context: DiagnosisContext | None = None
+    schema_slices: list[SchemaSlice] = Field(default_factory=list)
+    schema_optimization: SchemaOptimization | None = None
+    schema_strategy: Literal["sliced", "full"] = "sliced"
 
 
 class RepairRequest(StrictModel):
@@ -361,6 +430,8 @@ class ResultDocument(StrictModel):
     context_telemetry: ContextTelemetry | None = None
     context_manifest: ContextManifest | None = None
     context_optimization: ContextOptimization | None = None
+    schema_slice_manifest: list[SchemaSliceManifest] = Field(default_factory=list)
+    schema_optimization: SchemaOptimization | None = None
     warnings: list[str] = Field(default_factory=list)
     error: str | None = None
     error_code: ProviderFailureCategory | None = None

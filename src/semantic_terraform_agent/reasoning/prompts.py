@@ -33,6 +33,20 @@ _SECTION_NAMES = (
 def _schema_context(request: DiagnosisRequest) -> list[dict]:
     if request.context.selected_mode != "schema-aware":
         return []
+    if request.schema_strategy == "sliced" and request.schema_slices:
+        return [
+            item.model_dump(
+                mode="json",
+                by_alias=True,
+                include={
+                    "resource_type",
+                    "provider_source",
+                    "provider_version",
+                    "selected_schema",
+                },
+            )
+            for item in request.schema_slices
+        ]
     return [
         record.model_dump(mode="json", by_alias=True)
         for record in request.schemas

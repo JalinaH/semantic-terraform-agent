@@ -94,17 +94,30 @@ def build_context_telemetry(
     diagnosis_context = request.diagnosis_context
     schema_included = (
         request.context.selected_mode == "schema-aware"
-        and any(
-            record.extraction_status == "ok" and record.resource_schema is not None
-            for record in request.schemas
+        and (
+            bool(request.schema_slices)
+            or any(
+                record.extraction_status == "ok"
+                and record.resource_schema is not None
+                for record in request.schemas
+            )
         )
     )
 
     def sections(parts: PromptParts) -> dict[str, ContextSectionTelemetry]:
-        return {
+        result = {
             name: ContextSectionTelemetry(characters=characters)
             for name, characters in parts.section_characters.items()
         }
+        optimization = request.schema_optimization
+        if optimization is not None and "provider_schema" in result:
+            result["provider_schema"] = ContextSectionTelemetry(
+                characters=parts.section_characters["provider_schema"],
+                full_available_characters=optimization.full_schema_characters,
+                selected_schema_characters=optimization.selected_schema_characters,
+                reduction_ratio=optimization.character_reduction_ratio,
+            )
+        return result
 
     return ContextTelemetry(
         mode=request.context.selected_mode,

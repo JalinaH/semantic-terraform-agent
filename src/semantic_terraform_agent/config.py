@@ -49,6 +49,10 @@ class Limits:
     max_context_candidate_blocks: int = 3
     diff_context_lines: int = 3
     max_reference_depth: int = 1
+    max_schema_slice_chars: int = 8_000
+    max_schema_description_chars_per_field: int = 400
+    max_schema_paths: int = 32
+    max_nested_schema_depth: int = 4
     max_command_output_bytes: int = 50 * 1024 * 1024
     command_timeout_seconds: int = 180
 
