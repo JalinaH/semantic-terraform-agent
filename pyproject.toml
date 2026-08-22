@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "semantic-terraform-agent"
-version = "1.0.0"
+version = "1.0.1"
 description = "A local, schema-aware agent for diagnosing Terraform failures"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -23,6 +23,12 @@ semantic-terraform-agent = "semantic_terraform_agent.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/semantic_terraform_agent"]
+exclude = [
+  "src/semantic_terraform_agent/evaluation.py",
+  "src/semantic_terraform_agent/progressive_evaluation.py",
+  "src/semantic_terraform_agent/routing_evaluation.py",
+  "src/semantic_terraform_agent/schema_evaluation.py",
+]
 
 [tool.pytest.ini_options]
 addopts = "-q"

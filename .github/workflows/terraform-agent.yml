@@ -29,12 +29,12 @@ on:
       provider:
         description: LLM provider implementation
         required: false
-        default: gemini
+        default: openrouter
         type: string
       model:
         description: Provider model identifier
         required: false
-        default: gemini-3.6-flash
+        default: openrouter/free
         type: string
       model_routing:
         description: Model routing policy (fixed or auto)
@@ -209,7 +209,7 @@ jobs:
               fi
               ;;
             *)
-              echo "::error::Unsupported provider in version 1.0.0: ${PROVIDER}"
+              echo "::error::Unsupported provider in version 1.0.1: ${PROVIDER}"
               exit 1
               ;;
           esac

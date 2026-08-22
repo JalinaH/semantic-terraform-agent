@@ -8,8 +8,8 @@ semantic-terraform-agent diagnose \
   --terraform-dir deploy/terraform \
   --log-file /tmp/terraform-plan.stderr.log \
   --failed-stage plan \
-  --provider gemini \
-  --model gemini-3.6-flash \
+  --provider openrouter \
+  --model openrouter/free \
   --context-mode auto \
   --verify-patch \
   --max-repair-attempts 1 \

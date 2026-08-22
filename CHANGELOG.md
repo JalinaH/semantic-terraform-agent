@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.1
+
+- Made OpenRouter and `openrouter/free` the CLI and reusable-workflow defaults.
+- Removed the standalone benchmark workflow, comparison launchers, generated artifacts,
+  and duplicate release notes from the product repository.
+- Replaced historical benchmark documentation with a focused operator README.
+- Excluded retained regression-evaluation helpers from the production wheel.
+
 ## 1.0.0
 
 - Added exact repository-scoped Verified Failure Memory with mandatory fresh isolated verification.

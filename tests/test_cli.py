@@ -51,7 +51,7 @@ def test_cli_defaults_to_one_repair_attempt() -> None:
     )
     assert args.max_repair_attempts == 1
     assert args.failed_stage is None
-    assert args.provider == "gemini"
+    assert args.provider == "openrouter"
     assert args.model is None
     assert args.context_strategy == "deterministic-minimal-v1"
     assert args.schema_strategy == "sliced"
@@ -129,7 +129,18 @@ def test_cli_accepts_openrouter_and_dynamic_free_model() -> None:
     assert args.model == "new-provider/new-model:free"
 
 
-def test_cli_requires_explicit_openrouter_model(tmp_path, capsys) -> None:
+def test_cli_defaults_fixed_openrouter_to_free_router(tmp_path, capsys, monkeypatch) -> None:
+    captured = {}
+
+    def diagnose(**kwargs):
+        captured.update(kwargs)
+        from semantic_terraform_agent.config import InputError
+
+        raise InputError("sentinel after model resolution")
+
+    monkeypatch.setattr(
+        "semantic_terraform_agent.cli.diagnose_repository", diagnose
+    )
     output = tmp_path / "result.json"
     exit_code = main(
         [
@@ -147,7 +158,9 @@ def test_cli_requires_explicit_openrouter_model(tmp_path, capsys) -> None:
         ]
     )
     assert exit_code == 2
-    assert "--model is required" in capsys.readouterr().err
+    assert "sentinel after model resolution" in capsys.readouterr().err
+    assert captured["provider_name"] == "openrouter"
+    assert captured["model"] == "openrouter/free"
     assert '"status": "error"' in output.read_text()
 
 

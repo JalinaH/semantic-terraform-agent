@@ -11,6 +11,7 @@ from pydantic import ValidationError
 
 from semantic_terraform_agent.config import (
     DEFAULT_GEMINI_MODEL,
+    DEFAULT_OPENROUTER_MODEL,
     AgentError,
     InputError,
     ModelRoutingError,
@@ -39,12 +40,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("init", "fmt", "validate", "plan", "apply", "unknown"),
         help="explicit Terraform stage that produced the supplied failure log",
     )
-    diagnose.add_argument("--provider", choices=provider_names(), default="gemini")
+    diagnose.add_argument("--provider", choices=provider_names(), default="openrouter")
     diagnose.add_argument(
         "--model",
         help=(
-            "provider model ID; fixed Gemini defaults to gemini-2.5-flash, fixed "
-            "OpenRouter requires it, and auto routing may select it from the registry"
+            "provider model ID; fixed OpenRouter defaults to openrouter/free, fixed "
+            "Gemini defaults to gemini-2.5-flash, and auto routing uses the registry"
         ),
     )
     diagnose.add_argument(
@@ -401,18 +402,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.command != "diagnose":
         parser.error("a command is required")
     try:
-        if (
-            args.model is None
-            and args.provider != "gemini"
-            and args.model_routing == "fixed"
-        ):
-            raise InputError("--model is required when --provider openrouter is selected")
         model = (
             args.model
             or (
                 DEFAULT_GEMINI_MODEL
                 if args.provider == "gemini" and args.model_routing == "fixed"
-                else None
+                else (
+                    DEFAULT_OPENROUTER_MODEL
+                    if args.provider == "openrouter"
+                    and args.model_routing == "fixed"
+                    else None
+                )
             )
         )
         configured_cache = args.cache_dir
