@@ -29,6 +29,7 @@ env:
   AWS_REGION: ${{ vars.AWS_REGION }}
   TF_VAR_aws_region: ${{ vars.AWS_REGION }}
   TF_VAR_name_prefix: stfa-agent-${{ github.repository_id }}-${{ github.run_id }}
+  OPENROUTER_MODEL: ${{ vars.OPENROUTER_MODEL || 'openrouter/free' }}
 
 jobs:
   e2e:
@@ -132,15 +133,15 @@ jobs:
         shell: bash
         env:
           AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
           set -euo pipefail
           if [[ -z "${AWS_ROLE_ARN}" || -z "${AWS_REGION}" ]]; then
             echo "::error::Set repository variables AWS_ROLE_ARN and AWS_REGION."
             exit 1
           fi
-          if [[ -z "${GEMINI_API_KEY}" ]]; then
-            echo "::error::Set the GEMINI_API_KEY repository secret."
+          if [[ -z "${OPENROUTER_API_KEY}" ]]; then
+            echo "::error::Set the OPENROUTER_API_KEY repository secret."
             exit 1
           fi
 
@@ -154,7 +155,7 @@ jobs:
       - name: Run agent against selected Terraform failure
         shell: bash
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           RESULT_PATH: ${{ runner.temp }}/semantic-terraform-agent/result.json
           SEMANTIC_TERRAFORM_AGENT_PASSTHROUGH_ENV: >-
             AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY,AWS_SESSION_TOKEN,AWS_REGION,AWS_DEFAULT_REGION
@@ -166,8 +167,8 @@ jobs:
             --terraform-dir "${BENCHMARK_CASE}" \
             --log-file "${GITHUB_WORKSPACE}/${BENCHMARK_PATH}/${BENCHMARK_LOG}" \
             --failed-stage plan \
-            --provider gemini \
-            --model gemini-3.6-flash \
+            --provider openrouter \
+            --model "${OPENROUTER_MODEL}" \
             --context-mode auto \
             --verify-patch \
             --max-repair-attempts 1 \

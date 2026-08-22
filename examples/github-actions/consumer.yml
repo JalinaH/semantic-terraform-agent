@@ -121,11 +121,11 @@ jobs:
       failure_log_artifact: terraform-failure-log
       failure_log_path: terraform-failure.log
       failed_stage: ${{ needs.terraform.outputs.failed_stage }}
-      provider: gemini
-      model: gemini-3.6-flash
+      provider: openrouter
+      model: openrouter/free
       context_mode: auto
       max_repair_attempts: 1
       aws_region: ${{ vars.AWS_REGION }}
     secrets:
-      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
       AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
