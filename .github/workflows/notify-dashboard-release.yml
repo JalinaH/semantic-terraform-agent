@@ -1,0 +1,63 @@
+name: Deploy hosted worker for agent release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  notify-dashboard:
+    if: github.event.release.prerelease == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out released agent
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          persist-credentials: false
+
+      - name: Validate release version
+        id: release
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          printf '%s' "$RELEASE_TAG" | grep -Eq '^v1\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$' || {
+            echo "Only stable v1.x releases can deploy automatically."
+            exit 1
+          }
+          AGENT_VERSION="${RELEASE_TAG#v}"
+          PACKAGE_VERSION=$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
+          test "$PACKAGE_VERSION" = "$AGENT_VERSION" || {
+            echo "pyproject.toml version does not match the release tag."
+            exit 1
+          }
+          AGENT_COMMIT=$(git rev-parse HEAD)
+          {
+            echo "version=$AGENT_VERSION"
+            echo "commit=$AGENT_COMMIT"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Trigger dashboard worker deployment
+        env:
+          GH_TOKEN: ${{ secrets.DASHBOARD_DISPATCH_TOKEN }}
+          AGENT_TAG: ${{ github.event.release.tag_name }}
+          AGENT_VERSION: ${{ steps.release.outputs.version }}
+          AGENT_COMMIT: ${{ steps.release.outputs.commit }}
+        run: |
+          test -n "$GH_TOKEN" || {
+            echo "Missing agent repository secret: DASHBOARD_DISPATCH_TOKEN"
+            exit 1
+          }
+          jq -n \
+            --arg tag "$AGENT_TAG" \
+            --arg version "$AGENT_VERSION" \
+            --arg commit "$AGENT_COMMIT" \
+            '{event_type:"semantic-terraform-agent-released",client_payload:{agent_tag:$tag,agent_version:$version,agent_commit:$commit}}' \
+            > "$RUNNER_TEMP/dispatch.json"
+          gh api \
+            --method POST \
+            repos/JalinaH/semantic-terraform-dashboard/dispatches \
+            --input "$RUNNER_TEMP/dispatch.json"
