@@ -422,6 +422,31 @@ FinalVerificationStatus: TypeAlias = Literal[
     "verification_skipped",
 ]
 
+MutationEligibilityReasonCode: TypeAlias = Literal[
+    "verified_terraform_patch",
+    "not_verified",
+    "patch_rejected",
+    "verification_failed",
+    "verification_unavailable",
+    "verification_skipped",
+    "no_patch",
+    "unsafe_patch",
+    "non_terraform_files",
+    "source_revision_unknown",
+    "affected_files_unknown",
+    "patch_hash_unavailable",
+]
+
+MutationEligibilityDetailCode: TypeAlias = Literal[
+    "patch_empty",
+    "patch_scope_invalid",
+    "unsupported_file_operation",
+    "working_tree_not_clean",
+    "verification_provenance_incomplete",
+    "affected_file_missing",
+    "verified_patch_mismatch",
+]
+
 
 class VerificationCommands(StrictModel):
     patch_check: VerificationCommand | None = None
@@ -443,6 +468,55 @@ class VerificationAttempt(StrictModel):
     temporary_copy_cleaned: bool
     warnings: list[str] = Field(default_factory=list)
     candidate_source: Literal["llm", "verified_failure_memory"] = "llm"
+
+
+class SourceProvenance(StrictModel):
+    repository_scope: str
+    terraform_dir: str
+    git_commit_sha: str | None = None
+    git_tree_sha: str | None = None
+    caller_source_revision: str | None = None
+    verified_against_commit_sha: str | None = None
+    working_tree_mode: Literal["git_clean", "git_dirty", "non_git"]
+    source_fingerprint_sha256: str | None = None
+
+
+class VerificationProvenance(StrictModel):
+    attempt_number: int = Field(ge=1, le=2)
+    final_status: FinalVerificationStatus
+    verified_in_isolated_workspace: bool
+    patch_check_passed: bool
+    patch_apply_passed: bool
+    fmt_passed: bool
+    init_passed: bool
+    validate_passed: bool
+    plan_required: bool = True
+    plan_passed: bool
+    terraform_version: str | None = None
+    provider_versions: dict[str, str] = Field(default_factory=dict)
+
+
+class VerifiedPatchArtifact(StrictModel):
+    patch_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    affected_files: list[str]
+    repository_relative_paths_only: bool
+    terraform_files_only: bool
+    existing_files_only: bool
+    verification_status: FinalVerificationStatus
+    verification_passed: bool
+    verification_attempt: int = Field(ge=1, le=2)
+    verified_against_commit_sha: str | None = None
+    source_fingerprint_sha256: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
+    candidate_source: Literal["llm", "verified_failure_memory"]
+
+
+class MutationEligibility(StrictModel):
+    eligible: bool
+    reason_code: MutationEligibilityReasonCode
+    reasons: list[MutationEligibilityDetailCode] = Field(default_factory=list)
+    requires_fresh_head_check: bool = True
 
 
 class DiagnosisCandidate(StrictModel):
@@ -647,6 +721,10 @@ class ResultDocument(StrictModel):
     model_progression: ModelProgression | None = None
     resolution_source: Literal["llm", "verified_failure_memory"] | None = None
     cache: CacheTelemetry | None = None
+    verified_patch: VerifiedPatchArtifact | None = None
+    source_provenance: SourceProvenance | None = None
+    verification_provenance: VerificationProvenance | None = None
+    mutation_eligibility: MutationEligibility | None = None
     warnings: list[str] = Field(default_factory=list)
     error: str | None = None
     error_code: ProviderFailureCategory | None = None

@@ -4,7 +4,7 @@ Semantic Terraform Agent diagnoses Terraform CI failures, generates a candidate 
 and verifies that patch in an isolated temporary workspace. It supports arbitrary
 Terraform repositories and does not contain benchmark-specific resource logic.
 
-Version: `1.0.1`
+Version: `1.1.0`
 
 ## How it works
 
@@ -17,6 +17,7 @@ Terraform failure and Git diff
   → isolated patch application
   → terraform fmt/init/validate/plan
   → at most one repair or schema-context escalation
+  → exact verified-patch provenance and mutation eligibility
   → final result JSON
 ```
 
@@ -50,6 +51,7 @@ semantic-terraform-agent diagnose \
   --terraform-dir infrastructure \
   --log-file /tmp/terraform-plan.log \
   --failed-stage plan \
+  --source-revision "$(git -C /path/to/repository rev-parse HEAD)" \
   --context-mode auto \
   --verify-patch \
   --max-repair-attempts 1 \
@@ -75,6 +77,12 @@ semantic-terraform-agent diagnose \
 `--diff-file` is optional. Without it, the agent tries repository-local Git comparisons
 and records the selected comparison. Unified-diff paths must be relative to
 `--repo-path`.
+
+`--source-revision` is optional. It accepts only a full 40- or 64-character Git
+commit SHA and must match the checkout's detected `HEAD`. A mismatch fails before
+model inference. Non-Git repositories continue to work, but their patches are not
+mutation-eligible because a future platform cannot perform an exact head-freshness
+check.
 
 Gemini remains available as an explicit compatibility provider. It requires
 `GEMINI_API_KEY`; neither the CLI nor workflow selects it by default.
@@ -130,6 +138,30 @@ The JSON result includes repository/failure metadata, structured diagnosis, the 
 patch, isolated verification attempts, actual model usage/cost, separate context and model
 progression, optimization telemetry, cache status, and `resolution_source`.
 
+### Verified Patch Artifact
+
+Version 1.1 adds four backward-compatible top-level fields:
+
+- `verified_patch` binds the exact cleaned and verified `diagnosis.final_patch` with
+  a UTF-8 SHA-256, deterministic repository-relative affected files, candidate
+  source, final attempt, and verification status. Patch text is not duplicated;
+  `diagnosis.final_patch` remains the canonical artifact bytes.
+- `source_provenance` records the detected Git commit/tree, optional matching caller
+  revision, clean/dirty checkout state, Terraform directory, safe repository-scope
+  hash, and a fingerprint of the exact pre-patch affected files.
+- `verification_provenance` records concise pass/fail facts for patch check/apply and
+  Terraform fmt, init, validate, and plan without duplicating command logs.
+- `mutation_eligibility` is a deterministic advisory contract for a higher-level
+  platform. It never causes repository mutation.
+
+Eligibility requires a non-empty hashed patch, an exact clean Git revision, safe
+existing-file modifications confined to `.tf`/`.tf.json` files in the configured
+Terraform directory, and a freshly successful isolated verification through plan.
+New files, deletions, renames, binary changes, non-Terraform files, dirty/non-Git
+source, skipped/unavailable verification, and incomplete verification provenance are
+ineligible. A remembered patch is evaluated from scratch after fresh verification;
+stored eligibility is never trusted.
+
 On successful warm reuse, `resolution_source` is `verified_failure_memory`, `llm_calls`
 is empty, and current-run model usage is zero. Historical avoided usage is reported only
 when authoritative prior telemetry exists.
@@ -145,6 +177,14 @@ workspaces. State, `.terraform`, `.env`, credentials, private keys, arbitrary `f
 targets, and unrelated files are excluded. Commands run without a shell and with a
 reduced environment.
 
+The trust boundary is explicit: `semantic-terraform-agent` diagnoses and verifies in
+an isolated copy; TerraFix or another platform may later own a separate,
+human-authorized source mutation flow. Before applying anything, that platform must
+independently verify the patch SHA-256, compare the current PR head with
+`verified_against_commit_sha`, recheck repository permissions, and confirm the user's
+authorization. The agent does not perform the future-head check and never calls the
+GitHub API to write, commit, push, merge, apply, or destroy infrastructure.
+
 ## Reusable GitHub Actions workflow
 
 The production workflow is:
@@ -152,7 +192,7 @@ The production workflow is:
 ```yaml
 jobs:
   diagnose:
-    uses: JalinaH/semantic-terraform-agent/.github/workflows/terraform-agent.yml@v1.0.1
+    uses: JalinaH/semantic-terraform-agent/.github/workflows/terraform-agent.yml@v1.1.0
     permissions:
       contents: read
       id-token: write

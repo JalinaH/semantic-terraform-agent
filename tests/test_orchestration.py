@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import subprocess
+import hashlib
 from pathlib import Path
 
+import pytest
+
 from semantic_terraform_agent.cli import _print_summary
-from semantic_terraform_agent.config import ProviderError
+from semantic_terraform_agent.config import InputError, ProviderError
 from semantic_terraform_agent.models import (
     ModelDiagnosis,
     ProviderResponse,
@@ -119,6 +123,7 @@ def run_diagnosis(
     max_repair_attempts: int = 1,
     verification_enabled: bool = True,
     failed_stage: str | None = None,
+    source_revision: str | None = None,
 ):
     return diagnose_repository(
         repo_path=terraform_repo,
@@ -133,7 +138,34 @@ def run_diagnosis(
         max_repair_attempts=max_repair_attempts,
         verification_enabled=verification_enabled,
         failed_stage=failed_stage,
+        source_revision=source_revision,
     )
+
+
+def test_source_revision_mismatch_fails_before_model_inference(
+    terraform_repo: Path, failure_log: Path, diff_file: Path
+) -> None:
+    for command in (
+        ["git", "init", "-b", "main"],
+        ["git", "config", "user.email", "tests@example.invalid"],
+        ["git", "config", "user.name", "Tests"],
+        ["git", "add", "."],
+        ["git", "commit", "-m", "fixture"],
+    ):
+        subprocess.run(command, cwd=terraform_repo, check=True, capture_output=True)
+    provider = FakeProvider()
+    with pytest.raises(InputError, match="does not match"):
+        run_diagnosis(
+            terraform_repo,
+            failure_log,
+            diff_file,
+            provider,
+            lambda patch, layout, *, attempt: attempt_result(
+                patch, attempt, status="verified"
+            ),
+            source_revision="f" * 40,
+        )
+    assert provider.diagnose_calls == 0
 
 
 def test_successful_first_attempt_has_no_repair(
@@ -301,6 +333,9 @@ def test_final_patch_is_the_canonical_patch_used_by_verifier(
     result = run_diagnosis(terraform_repo, failure_log, diff_file, provider, verifier)
     assert result.diagnosis.initial.suggested_patch == INITIAL_PATCH
     assert result.diagnosis.final_patch == REPAIR_PATCH
+    assert result.verified_patch.patch_sha256 == hashlib.sha256(
+        REPAIR_PATCH.encode("utf-8")
+    ).hexdigest()
 
 
 def test_successful_second_attempt_preserves_history_and_confidence(

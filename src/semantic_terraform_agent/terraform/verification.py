@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from semantic_terraform_agent.collectors.repository import RepositoryLayout
@@ -29,6 +30,14 @@ class UnsafePatchError(ValueError):
     """A candidate patch is malformed or exceeds the verifier's path scope."""
 
 
+@dataclass(frozen=True)
+class PatchInspection:
+    affected_files: tuple[str, ...]
+    creates_files: bool
+    deletes_files: bool
+    renames_files: bool
+
+
 def find_git() -> str | None:
     return shutil.which("git")
 
@@ -37,7 +46,7 @@ def find_terraform() -> str | None:
     return shutil.which("terraform")
 
 
-def _normalize_patch_path(raw: str, layout: RepositoryLayout) -> str | None:
+def _safe_repository_patch_path(raw: str) -> str | None:
     value = raw.strip()
     if value.startswith('"'):
         try:
@@ -58,6 +67,14 @@ def _normalize_patch_path(raw: str, layout: RepositoryLayout) -> str | None:
     path = PurePosixPath(value)
     if not value or path.is_absolute() or any(part in ("", ".", "..") for part in path.parts):
         raise UnsafePatchError(f"patch path is not a safe repository-relative path: {value}")
+    return path.as_posix()
+
+
+def _normalize_patch_path(raw: str, layout: RepositoryLayout) -> str | None:
+    value = _safe_repository_patch_path(raw)
+    if value is None:
+        return None
+    path = PurePosixPath(value)
     if not value.endswith((".tf", ".tf.json")):
         raise UnsafePatchError(f"patch may modify only Terraform source files: {value}")
     terraform_dir = PurePosixPath(layout.terraform_dir)
@@ -72,6 +89,85 @@ def _normalize_patch_path(raw: str, layout: RepositoryLayout) -> str | None:
                 ) from exc
             path = scoped_path
     return path.as_posix()
+
+
+def inspect_patch(patch: str) -> PatchInspection:
+    """Parse unified-diff paths once using the verifier's path-safety rules."""
+    encoded_size = len(patch.encode("utf-8"))
+    if encoded_size > DEFAULT_LIMITS.max_patch_bytes:
+        raise UnsafePatchError(
+            f"candidate patch exceeds the {DEFAULT_LIMITS.max_patch_bytes}-byte limit"
+        )
+    if "\x00" in patch:
+        raise UnsafePatchError("candidate patch contains a NUL byte")
+    if "\x1b" in patch:
+        raise UnsafePatchError("candidate patch contains ANSI escape codes")
+    if any(line.strip().startswith("```") for line in patch.splitlines()):
+        raise UnsafePatchError("candidate patch contains a Markdown fence")
+    if "GIT binary patch" in patch or "Binary files " in patch:
+        raise UnsafePatchError("binary patches are not supported")
+
+    affected: list[str] = []
+    creates_files = False
+    deletes_files = False
+    renames_files = False
+    header_pairs = 0
+    lines = patch.splitlines()
+    for index, line in enumerate(lines):
+        if line.startswith("diff --git "):
+            try:
+                fields = shlex.split(line)
+            except ValueError as exc:
+                raise UnsafePatchError("invalid diff --git header") from exc
+            if len(fields) != 4:
+                raise UnsafePatchError("invalid diff --git header")
+            old_path = _safe_repository_patch_path(fields[2])
+            new_path = _safe_repository_patch_path(fields[3])
+            if old_path is None or new_path is None:
+                raise UnsafePatchError("diff --git paths cannot be /dev/null")
+            affected.extend((old_path, new_path))
+            renames_files = renames_files or old_path != new_path
+        if line.startswith(("rename from ", "rename to ", "copy from ", "copy to ")):
+            renames_files = True
+        if not line.startswith("--- ") or index + 1 >= len(lines):
+            continue
+        plus = lines[index + 1]
+        if not plus.startswith("+++ "):
+            continue
+        header_pairs += 1
+        old_path = _safe_repository_patch_path(line[4:])
+        new_path = _safe_repository_patch_path(plus[4:])
+        creates_files = creates_files or old_path is None
+        deletes_files = deletes_files or new_path is None
+        if old_path is not None:
+            affected.append(old_path)
+        if new_path is not None:
+            affected.append(new_path)
+        renames_files = renames_files or (
+            old_path is not None and new_path is not None and old_path != new_path
+        )
+    if header_pairs == 0:
+        raise UnsafePatchError("candidate patch is not a unified diff with ---/+++ headers")
+    if not affected:
+        raise UnsafePatchError("candidate patch does not identify a repository file")
+    return PatchInspection(
+        affected_files=tuple(dict.fromkeys(affected)),
+        creates_files=creates_files,
+        deletes_files=deletes_files,
+        renames_files=renames_files,
+    )
+
+
+def clean_candidate_patch(patch: str) -> str:
+    """Remove only one exact outer Markdown fence before scope validation."""
+    lines = patch.splitlines(keepends=True)
+    if len(lines) < 3:
+        return patch
+    opening = lines[0].strip().lower()
+    closing = lines[-1].strip()
+    if opening not in {"```", "```diff", "```patch"} or closing != "```":
+        return patch
+    return "".join(lines[1:-1])
 
 
 def _format_patch_path(path: str, prefix: str) -> str:
@@ -135,13 +231,7 @@ def _canonicalize_patch_headers(patch: str, layout: RepositoryLayout) -> str:
 
 
 def validate_patch_scope(patch: str, layout: RepositoryLayout) -> list[str]:
-    encoded_size = len(patch.encode("utf-8"))
-    if encoded_size > DEFAULT_LIMITS.max_patch_bytes:
-        raise UnsafePatchError(
-            f"candidate patch exceeds the {DEFAULT_LIMITS.max_patch_bytes}-byte limit"
-        )
-    if "\x00" in patch:
-        raise UnsafePatchError("candidate patch contains a NUL byte")
+    inspection = inspect_patch(patch)
     forbidden_markers = (
         "GIT binary patch",
         "Binary files ",
@@ -184,6 +274,8 @@ def validate_patch_scope(patch: str, layout: RepositoryLayout) -> list[str]:
         raise UnsafePatchError("candidate patch is not a unified diff with ---/+++ headers")
     if not changed:
         raise UnsafePatchError("candidate patch does not identify a Terraform source file")
+    if inspection.renames_files:
+        raise UnsafePatchError("rename and copy patches are not supported")
     return list(dict.fromkeys(changed))
 
 
@@ -356,6 +448,7 @@ def verify_candidate_patch(
     """Verify one candidate in a fresh filtered temporary repository copy."""
     commands = VerificationCommands()
     try:
+        patch = clean_candidate_patch(patch)
         changed_files = validate_patch_scope(patch, layout)
         patch = _canonicalize_patch_headers(patch, layout)
         changed_files = validate_patch_scope(patch, layout)
@@ -394,7 +487,7 @@ def verify_candidate_patch(
             home = temp_root / "home"
             home.mkdir()
             patch_file = temp_root / "candidate.patch"
-            patch_file.write_text(patch, encoding="utf-8")
+            patch_file.write_bytes(patch.encode("utf-8"))
         except OSError as exc:
             return _attempt_result(
                 attempt=attempt,

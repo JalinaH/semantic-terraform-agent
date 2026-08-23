@@ -125,6 +125,10 @@ def test_warm_verified_memory_uses_zero_llm_calls_and_fresh_verification(
     assert warm.resolution_source == "verified_failure_memory"
     assert warm.cache.failure_memory.status == "hit_verified"
     assert warm.cache.failure_memory.reuse_attempt.candidate_source == "verified_failure_memory"
+    assert warm.verified_patch.candidate_source == "verified_failure_memory"
+    assert warm.verified_patch.patch_sha256 is not None
+    assert warm.mutation_eligibility.eligible is False
+    assert warm.mutation_eligibility.reason_code == "not_verified"
     assert warm.llm_calls == []
     assert warm.llm_usage.call_count == 0
     assert warm.llm_usage.input_tokens == 0
@@ -223,6 +227,7 @@ def test_stale_memory_falls_back_with_full_model_budget(
     assert result.resolution_source == "llm"
     assert result.cache.failure_memory.status == "hit_stale"
     assert result.cache.failure_memory.reuse_attempt.status == "rejected"
+    assert result.verified_patch.candidate_source == "llm"
     assert result.llm_usage.call_count == 1
     assert provider.calls == 2
     assert calls == 2

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shutil
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -26,6 +27,22 @@ def candidate_patch(value: str = "safe") -> str:
 +  mode = "{value}"
  }}
 '''
+
+
+def test_production_code_contains_no_repository_or_terraform_mutation_commands() -> None:
+    source_root = Path(__file__).parents[1] / "src" / "semantic_terraform_agent"
+    production = "\n".join(
+        path.read_text(encoding="utf-8") for path in source_root.rglob("*.py")
+    )
+    for executable, command in (
+        ("git", "commit"),
+        ("git", "push"),
+        ("git", "merge"),
+        ("terraform", "apply"),
+        ("terraform", "destroy"),
+    ):
+        pattern = rf"[\"']{executable}[\"']\s*,\s*[\"']{command}[\"']"
+        assert re.search(pattern, production) is None
 
 
 def passed(recorded: list[str]) -> VerificationCommand:
@@ -128,6 +145,37 @@ def test_successful_plan_verification_uses_exact_safe_flags(
         "terraform",
     ]
     assert all(cwd != layout.terraform_root for _, cwd in calls)
+
+
+def test_outer_markdown_fence_is_removed_before_exact_verification(
+    monkeypatch, terraform_repo: Path
+) -> None:
+    layout = discover_repository(terraform_repo, Path("infrastructure"))
+    monkeypatch.setattr(verification_module, "find_git", lambda: "/usr/bin/git")
+    monkeypatch.setattr(verification_module, "find_terraform", lambda: "/usr/bin/terraform")
+    monkeypatch.setattr(
+        verification_module,
+        "_run_command",
+        lambda actual, recorded, **kwargs: passed(recorded),
+    )
+    result = verify_candidate_patch(f"```diff\n{candidate_patch()}```\n", layout)
+    assert result.status == "verified"
+    assert "```" not in result.patch
+    assert result.patch.startswith("diff --git ")
+
+
+def test_ansi_patch_is_rejected_before_commands(
+    monkeypatch, terraform_repo: Path
+) -> None:
+    layout = discover_repository(terraform_repo, Path("infrastructure"))
+    monkeypatch.setattr(
+        verification_module,
+        "find_git",
+        lambda: pytest.fail("Git lookup must not run for an ANSI patch"),
+    )
+    result = verify_candidate_patch(f"\x1b[31m{candidate_patch()}", layout)
+    assert result.status == "rejected"
+    assert "ANSI" in result.warnings[0]
 
 
 def test_plan_failure_records_first_failing_stage(

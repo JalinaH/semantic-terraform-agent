@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.1.0
+
+- Added a stable verified-patch artifact with exact UTF-8 SHA-256 provenance.
+- Added deterministic repository-relative affected-file and Terraform-only manifests.
+- Added detected Git commit/tree provenance and optional strict `--source-revision`
+  validation before model inference.
+- Added current-source fingerprints and concise isolated-verification provenance.
+- Added conservative mutation eligibility for future human-approved platform flows;
+  only verified modifications to existing Terraform files from a clean Git revision
+  qualify.
+- Recompute provenance and eligibility after fresh verification of a Verified Failure
+  Memory candidate.
+- Added no GitHub, branch, repository, or Terraform mutation behavior.
+
 ## 1.0.1
 
 - Made OpenRouter and `openrouter/free` the CLI and reusable-workflow defaults.

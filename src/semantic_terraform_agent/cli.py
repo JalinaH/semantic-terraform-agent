@@ -116,6 +116,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--repository-id",
         help="stable non-secret repository identity used only to scope cache fingerprints",
     )
+    diagnose.add_argument(
+        "--source-revision",
+        help=(
+            "optional full Git commit SHA expected at repository HEAD; a mismatch "
+            "fails before model inference"
+        ),
+    )
     diagnose.add_argument("--output", required=True, type=Path)
 
     cache = subparsers.add_parser("cache", help="inspect or clear the local cache")
@@ -228,6 +235,22 @@ def _print_summary(result: ResultDocument, output: Path) -> None:
         print(f"  Provider schema:   {result.cache.provider_schema.status}")
         print(f"  Schema slice:      {result.cache.schema_slice.status}")
         print(f"  LLM calls avoided: {memory.llm_calls_avoided}")
+    if result.verified_patch is not None and result.mutation_eligibility is not None:
+        artifact = result.verified_patch
+        eligibility = result.mutation_eligibility
+        print("Patch artifact:")
+        print(f"  SHA-256:          {artifact.patch_sha256 or 'not available'}")
+        print(
+            "  Files:            "
+            + (", ".join(artifact.affected_files) or "not identified")
+        )
+        print(
+            "  Source revision:  "
+            f"{artifact.verified_against_commit_sha or 'not available'}"
+        )
+        print(f"  Apply eligible:   {'yes' if eligibility.eligible else 'no'}")
+        if not eligibility.eligible:
+            print(f"  Reason:           {eligibility.reason_code}")
     print("Final verification:")
     print(f"  {diagnosis.verification.status.replace('_', ' ').upper()}")
     if diagnosis.verification.reason:
@@ -445,6 +468,7 @@ def main(argv: list[str] | None = None) -> int:
             cache_dir=configured_cache,
             failure_memory_enabled=failure_memory_enabled,
             repository_id=args.repository_id,
+            source_revision=args.source_revision,
         )
         _write_result(args.output, result)
     except (AgentError, OSError, ValidationError, ValueError) as exc:

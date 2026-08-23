@@ -209,7 +209,7 @@ jobs:
               fi
               ;;
             *)
-              echo "::error::Unsupported provider in version 1.0.1: ${PROVIDER}"
+              echo "::error::Unsupported provider in version 1.1.0: ${PROVIDER}"
               exit 1
               ;;
           esac
@@ -410,6 +410,7 @@ jobs:
             diagnose
             --repo-path "${GITHUB_WORKSPACE}"
             --terraform-dir "${TERRAFORM_DIR}"
+            --source-revision "${CHECKOUT_SHA}"
             --log-file "${FAILURE_LOG}"
             --failed-stage "${FAILED_STAGE}"
             --provider "${PROVIDER}"

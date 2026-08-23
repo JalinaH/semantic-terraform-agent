@@ -105,6 +105,10 @@ from semantic_terraform_agent.terraform.schema import (
     inspect_schemas,
     inspect_terraform_version,
 )
+from semantic_terraform_agent.terraform.provenance import (
+    build_verified_patch_contract,
+    collect_source_provenance,
+)
 from semantic_terraform_agent.terraform.verification import (
     skipped_verification,
     verify_candidate_patch,
@@ -284,10 +288,11 @@ def diagnose_repository(
     cache_dir: Path | None = None,
     failure_memory_enabled: bool = False,
     repository_id: str | None = None,
+    source_revision: str | None = None,
     cache_store: LocalCacheStore | None = None,
 ) -> ResultDocument:
     if max_repair_attempts not in (0, 1):
-        raise InputError("max_repair_attempts must be 0 or 1 in version 1.0.1")
+        raise InputError("max_repair_attempts must be 0 or 1 in version 1.1.0")
     selected_provider = parse_provider_name(provider_name)
     total_start = time.perf_counter()
     timing: dict[str, float] = {
@@ -305,6 +310,7 @@ def diagnose_repository(
         "failure_memory_lookup_seconds": 0.0,
         "failure_memory_write_seconds": 0.0,
         "cache_lookup_seconds": 0.0,
+        "source_provenance_seconds": 0.0,
     }
     warnings: list[str] = []
 
@@ -315,6 +321,13 @@ def diagnose_repository(
         raise InputError("invalid model routing mode or maximum model tier") from exc
     started = time.perf_counter()
     layout = discover_repository(repo_path, terraform_dir)
+    source_started = time.perf_counter()
+    source_provenance = collect_source_provenance(
+        layout,
+        source_revision=source_revision,
+        repository_id=repository_id,
+    )
+    timing["source_provenance_seconds"] = _elapsed(source_started)
     diff = collect_diff(layout, diff_file)
     failure = collect_failure_log(log_file)
     if failed_stage is not None:
@@ -525,6 +538,22 @@ def diagnose_repository(
                         initial_input_tokens=0,
                         total_input_tokens=0,
                     )
+                    memory_terraform = TerraformInfo(
+                        version=terraform_version_hint,
+                        schema_extraction_status="not-requested",
+                        schemas=[],
+                    )
+                    (
+                        verified_patch,
+                        source_provenance,
+                        verification_provenance,
+                        mutation_eligibility,
+                    ) = build_verified_patch_contract(
+                        diagnosis=diagnosis,
+                        layout=layout,
+                        source=source_provenance,
+                        terraform=memory_terraform,
+                    )
                     return ResultDocument(
                         status="ok",
                         repository=RepositoryInfo(
@@ -535,11 +564,7 @@ def diagnose_repository(
                             diff_source=diff.source,
                             diff_comparison=diff.comparison,
                         ),
-                        terraform=TerraformInfo(
-                            version=terraform_version_hint,
-                            schema_extraction_status="not-requested",
-                            schemas=[],
-                        ),
+                        terraform=memory_terraform,
                         failure=failure,
                         context=context,
                         diagnosis=diagnosis,
@@ -555,6 +580,10 @@ def diagnose_repository(
                         model_progression=None,
                         resolution_source="verified_failure_memory",
                         cache=cache_telemetry,
+                        verified_patch=verified_patch,
+                        source_provenance=source_provenance,
+                        verification_provenance=verification_provenance,
+                        mutation_eligibility=mutation_eligibility,
                         warnings=warnings,
                     )
                 memory_telemetry = memory_telemetry.model_copy(
@@ -958,8 +987,8 @@ def diagnose_repository(
             )
             attempts.append(second_attempt)
 
-    assert semantic_call_attempts <= 2, "v0.9 permits at most two semantic model calls"
-    assert len(llm_calls) <= 2, "v0.9 permits at most two validated model responses"
+    assert semantic_call_attempts <= 2, "the agent permits at most two semantic model calls"
+    assert len(llm_calls) <= 2, "the agent permits at most two validated model responses"
     for invocation, routing_decision in zip(llm_calls, routing_decisions, strict=False):
         assert invocation.provider is routing_decision.selected_provider
         assert invocation.requested_model == routing_decision.selected_model
@@ -1153,6 +1182,17 @@ def diagnose_repository(
         6,
     )
     timing["total_seconds"] = _elapsed(total_start)
+    (
+        verified_patch,
+        source_provenance,
+        verification_provenance,
+        mutation_eligibility,
+    ) = build_verified_patch_contract(
+        diagnosis=diagnosis,
+        layout=layout,
+        source=source_provenance,
+        terraform=terraform_info,
+    )
     return ResultDocument(
         status="ok",
         repository=RepositoryInfo(
@@ -1186,5 +1226,9 @@ def diagnose_repository(
             provider_schema=schema_cache_telemetry,
             schema_slice=slice_cache_telemetry,
         ),
+        verified_patch=verified_patch,
+        source_provenance=source_provenance,
+        verification_provenance=verification_provenance,
+        mutation_eligibility=mutation_eligibility,
         warnings=warnings,
     )

@@ -58,6 +58,27 @@ def test_cli_defaults_to_one_repair_attempt() -> None:
     assert args.model_routing == "fixed"
     assert args.max_model_tier == "premium"
     assert args.model_registry is None
+    assert args.source_revision is None
+
+
+def test_cli_accepts_full_source_revision() -> None:
+    revision = "a" * 40
+    args = build_parser().parse_args(
+        [
+            "diagnose",
+            "--repo-path",
+            ".",
+            "--terraform-dir",
+            "infrastructure",
+            "--log-file",
+            "plan.log",
+            "--source-revision",
+            revision,
+            "--output",
+            "result.json",
+        ]
+    )
+    assert args.source_revision == revision
 
 
 def test_cli_accepts_auto_routing_without_explicit_openrouter_model() -> None:
