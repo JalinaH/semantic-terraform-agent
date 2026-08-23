@@ -4,12 +4,18 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing stable tag to release after recovering a failed tag workflow"
+        required: true
+        type: string
 
 permissions:
   contents: write
 
 concurrency:
-  group: agent-release-${{ github.ref_name }}
+  group: agent-release-${{ inputs.release_tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -18,9 +24,27 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
+      - name: Resolve release tag
+        id: target
+        env:
+          PUSHED_TAG: ${{ github.ref_name }}
+          MANUAL_TAG: ${{ inputs.release_tag }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            RELEASE_TAG="$MANUAL_TAG"
+          else
+            RELEASE_TAG="$PUSHED_TAG"
+          fi
+          printf '%s' "$RELEASE_TAG" | grep -Eq '^v1\.[0-9]+\.[0-9]+$' || {
+            echo "Stable releases must use the full v1.x.y format."
+            exit 1
+          }
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
       - name: Check out tagged commit
         uses: actions/checkout@v6
         with:
+          ref: ${{ steps.target.outputs.tag }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -33,7 +57,7 @@ jobs:
       - name: Validate immutable release identity
         id: release
         env:
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ steps.target.outputs.tag }}
         run: |
           printf '%s' "$RELEASE_TAG" | grep -Eq '^v1\.[0-9]+\.[0-9]+$' || {
             echo "Stable releases must use the full v1.x.y format."
@@ -55,7 +79,7 @@ jobs:
       - name: Install release dependencies
         run: |
           python -m pip install --disable-pip-version-check --upgrade pip
-          python -m pip install --disable-pip-version-check ".[dev]" build
+          python -m pip install --disable-pip-version-check ".[dev]" build "ruff==0.11.10"
 
       - name: Run release validation
         run: |
@@ -67,7 +91,7 @@ jobs:
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ steps.target.outputs.tag }}
           AGENT_VERSION: ${{ steps.release.outputs.version }}
         run: |
           if gh release view "$RELEASE_TAG" > /dev/null 2>&1; then
@@ -83,7 +107,7 @@ jobs:
       - name: Trigger hosted worker deployment
         env:
           GH_TOKEN: ${{ secrets.DASHBOARD_DISPATCH_TOKEN }}
-          AGENT_TAG: ${{ github.ref_name }}
+          AGENT_TAG: ${{ steps.target.outputs.tag }}
           AGENT_VERSION: ${{ steps.release.outputs.version }}
           AGENT_COMMIT: ${{ steps.release.outputs.commit }}
         run: |
