@@ -1,0 +1,103 @@
+name: Release Semantic Terraform Agent
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: agent-release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Validate, release, and deploy hosted worker
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out tagged commit
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Validate immutable release identity
+        id: release
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          printf '%s' "$RELEASE_TAG" | grep -Eq '^v1\.[0-9]+\.[0-9]+$' || {
+            echo "Stable releases must use the full v1.x.y format."
+            exit 1
+          }
+          AGENT_VERSION="${RELEASE_TAG#v}"
+          PACKAGE_VERSION=$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
+          test "$PACKAGE_VERSION" = "$AGENT_VERSION" || {
+            echo "pyproject.toml version does not match the pushed tag."
+            exit 1
+          }
+          AGENT_COMMIT=$(git rev-parse HEAD)
+          printf '%s' "$AGENT_COMMIT" | grep -Eq '^[0-9a-f]{40}$' || exit 1
+          {
+            echo "version=$AGENT_VERSION"
+            echo "commit=$AGENT_COMMIT"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install release dependencies
+        run: |
+          python -m pip install --disable-pip-version-check --upgrade pip
+          python -m pip install --disable-pip-version-check ".[dev]" build
+
+      - name: Run release validation
+        run: |
+          ruff check src tests
+          pytest
+          python -m build
+          python -c 'import importlib.metadata; assert importlib.metadata.version("semantic-terraform-agent") == "${{ steps.release.outputs.version }}"'
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          AGENT_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          if gh release view "$RELEASE_TAG" > /dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists; keeping it unchanged."
+          else
+            gh release create "$RELEASE_TAG" \
+              --verify-tag \
+              --title "Semantic Terraform Agent $AGENT_VERSION" \
+              --generate-notes \
+              dist/*
+          fi
+
+      - name: Trigger hosted worker deployment
+        env:
+          GH_TOKEN: ${{ secrets.DASHBOARD_DISPATCH_TOKEN }}
+          AGENT_TAG: ${{ github.ref_name }}
+          AGENT_VERSION: ${{ steps.release.outputs.version }}
+          AGENT_COMMIT: ${{ steps.release.outputs.commit }}
+        run: |
+          test -n "$GH_TOKEN" || {
+            echo "Missing repository secret: DASHBOARD_DISPATCH_TOKEN"
+            exit 1
+          }
+          jq -n \
+            --arg tag "$AGENT_TAG" \
+            --arg version "$AGENT_VERSION" \
+            --arg commit "$AGENT_COMMIT" \
+            '{event_type:"semantic-terraform-agent-released",client_payload:{agent_tag:$tag,agent_version:$version,agent_commit:$commit}}' \
+            > "$RUNNER_TEMP/dispatch.json"
+          gh api \
+            --method POST \
+            repos/JalinaH/semantic-terraform-dashboard/dispatches \
+            --input "$RUNNER_TEMP/dispatch.json"
