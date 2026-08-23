@@ -27,6 +27,7 @@ _SECTION_NAMES = (
     "original_diagnosis",
     "original_patch",
     "verification_evidence",
+    "patch_failure",
     "escalation_evidence",
 )
 
@@ -136,11 +137,18 @@ def build_repair_prompt_parts(request: RepairRequest) -> PromptParts:
             "ORIGINAL CANDIDATE PATCH\n" + request.previous_diagnosis.suggested_patch
         ),
         "verification_evidence": _render_verification_evidence(request),
+        "patch_failure": _render_patch_failure(request),
         "escalation_evidence": _render_escalation_evidence(request),
         "metadata": _render_metadata(request.original),
         "provider_schema": _render_schema(request.original),
     }
-    if request.second_attempt_reason.value == "context_escalation":
+    if request.repair_reason == "malformed_patch":
+        opening = """The Terraform diagnosis is already complete, but the candidate patch
+was rejected because its unified-diff representation is malformed. Preserve the diagnosed
+change and all intended file scope. Correct only the patch serialization needed to produce
+a valid unified diff. Do not rediagnose the Terraform failure, change the intended fix, or
+modify additional files."""
+    elif request.second_attempt_reason.value == "context_escalation":
         opening = """The first candidate did not pass Terraform verification. Additional
 deterministically selected provider-schema context is now available. Revise the diagnosis
 and produce one final candidate patch that addresses the verification evidence."""
@@ -165,6 +173,22 @@ commentary."""
         system,
         sections,
         selected_context_characters=context.selected_context_characters,
+    )
+
+
+def _render_patch_failure(request: RepairRequest) -> str:
+    attempt = request.failed_attempt
+    if attempt.failure_category is None and attempt.failure_reason_code is None:
+        return ""
+    payload = {
+        "category": (
+            attempt.failure_category.value if attempt.failure_category else None
+        ),
+        "reason_code": attempt.failure_reason_code,
+        "description": attempt.failure_description,
+    }
+    return "PATCH PARSER FAILURE\n" + json.dumps(
+        payload, separators=(",", ":"), sort_keys=True
     )
 
 
@@ -337,6 +361,16 @@ def _build_legacy_repair_prompt_parts(request: RepairRequest) -> PromptParts:
         "failed_command_evidence": failed_evidence,
         "relevant_provider_schemas": _schema_context(original),
         "second_attempt_reason": request.second_attempt_reason.value,
+        "repair_reason": request.repair_reason,
+        "patch_failure": {
+            "category": (
+                request.failed_attempt.failure_category.value
+                if request.failed_attempt.failure_category
+                else None
+            ),
+            "reason_code": request.failed_attempt.failure_reason_code,
+            "description": request.failed_attempt.failure_description,
+        },
         "escalation_decision": (
             request.escalation_decision.model_dump(mode="json")
             if request.escalation_decision
@@ -361,6 +395,13 @@ terraform_source, git_diff, provider_schema. Confidence remains a model estimate
 0 and 1, not a verification result.
 
 Return only the JSON response with no Markdown fence, preamble, or trailing commentary."""
+    if request.repair_reason == "malformed_patch":
+        system = """The Terraform diagnosis is already complete. Correct only the malformed
+unified-diff representation in suggested_patch. Preserve the diagnosed change, intended
+values, repository-relative Terraform file scope, and all other diagnosis fields. Do not
+rediagnose the failure or modify additional files. Return the same strict JSON response
+schema with suggested_patch containing only a valid unified diff, without Markdown fences
+or explanation text. Only one bounded second attempt is allowed."""
     return PromptParts(
         system=system,
         user=f"""REPAIR CONTEXT

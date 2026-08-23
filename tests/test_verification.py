@@ -1,14 +1,14 @@
 from __future__ import annotations
 
-import shutil
 import re
+import shutil
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from semantic_terraform_agent.collectors.repository import discover_repository
-from semantic_terraform_agent.models import VerificationCommand
+from semantic_terraform_agent.models import PatchFailureCategory, VerificationCommand
 from semantic_terraform_agent.terraform import verification as verification_module
 from semantic_terraform_agent.terraform.verification import (
     UnsafePatchError,
@@ -147,7 +147,7 @@ def test_successful_plan_verification_uses_exact_safe_flags(
     assert all(cwd != layout.terraform_root for _, cwd in calls)
 
 
-def test_outer_markdown_fence_is_removed_before_exact_verification(
+def test_outer_markdown_fence_is_classified_as_repairable(
     monkeypatch, terraform_repo: Path
 ) -> None:
     layout = discover_repository(terraform_repo, Path("infrastructure"))
@@ -159,9 +159,9 @@ def test_outer_markdown_fence_is_removed_before_exact_verification(
         lambda actual, recorded, **kwargs: passed(recorded),
     )
     result = verify_candidate_patch(f"```diff\n{candidate_patch()}```\n", layout)
-    assert result.status == "verified"
-    assert "```" not in result.patch
-    assert result.patch.startswith("diff --git ")
+    assert result.status == "rejected"
+    assert result.failure_category is PatchFailureCategory.MALFORMED_REPAIRABLE
+    assert result.failure_reason_code == "markdown_fence_leak"
 
 
 def test_ansi_patch_is_rejected_before_commands(
@@ -176,6 +176,67 @@ def test_ansi_patch_is_rejected_before_commands(
     result = verify_candidate_patch(f"\x1b[31m{candidate_patch()}", layout)
     assert result.status == "rejected"
     assert "ANSI" in result.warnings[0]
+    assert result.failure_category is PatchFailureCategory.UNSAFE
+
+
+@pytest.mark.parametrize(
+    ("patch", "reason"),
+    [
+        ('resource "example_widget" "primary" { mode = "safe" }', "missing_diff_headers"),
+        (
+            "--- a/infrastructure/main.tf+++ b/infrastructure/main.tf@@ -1 +1 @@-a+b",
+            "concatenated_diff",
+        ),
+        (
+            "--- a/infrastructure/main.tf\n+++ b/infrastructure/main.tf\n@@ broken @@\n-a\n+b\n",
+            "malformed_hunk",
+        ),
+        (
+            "--- a/infrastructure/main.tf\n+++ b/infrastructure/main.tf\n@@ -1 +1 @@\ninvalid\n",
+            "invalid_diff_structure",
+        ),
+    ],
+)
+def test_malformed_patch_shapes_are_repairable(
+    terraform_repo: Path, patch: str, reason: str
+) -> None:
+    layout = discover_repository(terraform_repo, Path("infrastructure"))
+    result = verify_candidate_patch(patch, layout)
+    assert result.status == "rejected"
+    assert result.failure_category is PatchFailureCategory.MALFORMED_REPAIRABLE
+    assert result.failure_reason_code == reason
+
+
+@pytest.mark.parametrize(
+    ("patch", "reason"),
+    [
+        ("--- a/../../secret.tf\n+++ b/../../secret.tf\n@@ -1 +1 @@\n-a\n+b\n", "unsafe_path"),
+        ("--- /absolute/main.tf\n+++ /absolute/main.tf\n@@ -1 +1 @@\n-a\n+b\n", "unsafe_path"),
+        ("--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-a\n+b\n", "non_terraform_path"),
+        ("GIT binary patch\nliteral 1\nA", "binary_patch"),
+        ("--- /dev/null\n+++ b/infrastructure/new.tf\n@@ -0,0 +1 @@\n+x\n", "file_creation"),
+        ("--- a/infrastructure/main.tf\n+++ /dev/null\n@@ -1 +0,0 @@\n-x\n", "file_deletion"),
+        ("--- a/infrastructure/main.tf\n+++ b/infrastructure/other.tf\n@@ -1 +1 @@\n-a\n+b\n", "file_rename"),
+    ],
+)
+def test_unsafe_patch_shapes_never_become_repairable(
+    terraform_repo: Path, patch: str, reason: str
+) -> None:
+    layout = discover_repository(terraform_repo, Path("infrastructure"))
+    result = verify_candidate_patch(patch, layout)
+    assert result.status == "rejected"
+    assert result.failure_category is PatchFailureCategory.UNSAFE
+    assert result.failure_reason_code == reason
+
+
+def test_symlink_target_is_unsafe(terraform_repo: Path) -> None:
+    linked = terraform_repo / "infrastructure/linked.tf"
+    linked.symlink_to(terraform_repo / "infrastructure/main.tf")
+    layout = discover_repository(terraform_repo, Path("infrastructure"))
+    patch = "--- a/infrastructure/linked.tf\n+++ b/infrastructure/linked.tf\n@@ -1 +1 @@\n-a\n+b\n"
+    result = verify_candidate_patch(patch, layout)
+    assert result.failure_category is PatchFailureCategory.UNSAFE
+    assert result.failure_reason_code == "symlink_escape"
 
 
 def test_plan_failure_records_first_failing_stage(
@@ -197,6 +258,7 @@ def test_plan_failure_records_first_failing_stage(
     assert result.status == "failed"
     assert result.failed_stage == "plan"
     assert result.commands.plan.status == "failed"
+    assert result.failure_category is PatchFailureCategory.SEMANTIC_VERIFICATION_FAILURE
 
 
 def test_plan_not_executed_when_validate_fails(
@@ -237,6 +299,30 @@ def test_missing_terraform_is_unavailable_and_does_not_plan(
     assert result.commands.patch_apply.status == "passed"
     assert result.commands.plan.status == "skipped"
     assert result.warnings == ["Terraform executable was not found."]
+    assert result.failure_category is PatchFailureCategory.ENVIRONMENT_FAILURE
+
+
+def test_command_execution_error_is_classified_as_environment_failure(
+    monkeypatch, terraform_repo: Path
+) -> None:
+    layout = discover_repository(terraform_repo, Path("infrastructure"))
+    monkeypatch.setattr(verification_module, "find_git", lambda: "/usr/bin/git")
+    monkeypatch.setattr(
+        verification_module,
+        "_run_command",
+        lambda actual, recorded, **kwargs: VerificationCommand(
+            command=recorded,
+            status="error",
+            stderr="Command timed out.",
+        ),
+    )
+
+    result = verify_candidate_patch(candidate_patch(), layout)
+
+    assert result.status == "unavailable"
+    assert result.failed_stage == "patch_check"
+    assert result.failure_category is PatchFailureCategory.ENVIRONMENT_FAILURE
+    assert result.failure_reason_code == "environment_failure"
 
 
 def test_state_terraform_directory_and_plan_files_are_excluded(

@@ -11,6 +11,7 @@ from semantic_terraform_agent.models import (
     EscalationDecision,
     FailureInfo,
     ModelDiagnosis,
+    PatchFailureCategory,
     VerificationAttempt,
     VerificationCommand,
     VerificationErrorRelation,
@@ -125,6 +126,26 @@ class ContextEscalationPolicy:
                 level,
                 "verification_skipped",
                 "Verification was skipped, so insufficiency cannot be established.",
+                signals,
+                relation,
+            )
+        if (
+            verification.status == "rejected"
+            and verification.failure_category
+            is PatchFailureCategory.MALFORMED_REPAIRABLE
+        ):
+            if second_attempt_enabled:
+                return _repair(
+                    level,
+                    "malformed_patch",
+                    "The intended Terraform change is in scope, but its unified-diff representation is malformed.",
+                    signals,
+                    relation,
+                )
+            return _stop(
+                level,
+                "second_attempt_disabled",
+                "The malformed patch is repairable, but the bounded second attempt is disabled.",
                 signals,
                 relation,
             )
@@ -279,7 +300,10 @@ def classify_verification_error(
     failure: FailureInfo,
     verification: VerificationAttempt,
 ) -> VerificationErrorRelation:
-    if verification.status == "unavailable":
+    if (
+        verification.status == "unavailable"
+        or verification.failure_category is PatchFailureCategory.ENVIRONMENT_FAILURE
+    ):
         return VerificationErrorRelation.ENVIRONMENT_FAILURE
     output = _failed_output(verification)
     lowered = output.lower()
@@ -375,6 +399,10 @@ def _base_signals(
     signals = [f"verification status is {verification.status}"]
     if verification.failed_stage:
         signals.append(f"verification failed at {verification.failed_stage}")
+    if verification.failure_category is not None:
+        signals.append(f"patch failure category is {verification.failure_category.value}")
+    if verification.failure_reason_code is not None:
+        signals.append(f"patch failure reason is {verification.failure_reason_code}")
     signals.append(f"verification error relation is {relation.value}")
     return signals
 

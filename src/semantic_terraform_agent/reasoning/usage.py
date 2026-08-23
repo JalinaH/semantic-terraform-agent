@@ -31,6 +31,7 @@ def invocation_from_response(
     latency_ms: int,
     context_level: ContextLevel | None = None,
     routing_decision: ModelRoutingDecision | None = None,
+    repair_reason: str | None = None,
 ) -> LLMInvocation:
     """Use provider telemetry, or adapt a legacy provider response safely."""
     if response.llm_call is not None:
@@ -46,6 +47,7 @@ def invocation_from_response(
                 "call_number": (
                     routing_decision.call_number if routing_decision else None
                 ),
+                "repair_reason": repair_reason,
             }
         )
     return LLMInvocation(
@@ -60,6 +62,7 @@ def invocation_from_response(
         routing_tier=(routing_decision.selected_tier if routing_decision else None),
         routing_reason=(routing_decision.reason_code if routing_decision else None),
         call_number=(routing_decision.call_number if routing_decision else None),
+        repair_reason=repair_reason,
         prompt_characters=prompt.prompt_characters,
         system_prompt_characters=len(prompt.system),
         user_prompt_characters=len(prompt.user),
@@ -192,6 +195,7 @@ def build_context_telemetry(
         calls=[
             ContextCallTelemetry(
                 call_type=call.call_type,
+                repair_reason=call.repair_reason,
                 context_level=call.context_level or call_request.context_level,
                 prompt_characters=call.prompt_characters,
                 system_prompt_characters=call.system_prompt_characters,

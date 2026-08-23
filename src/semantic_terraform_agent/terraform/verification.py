@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shlex
 import shutil
 import subprocess
@@ -14,6 +15,8 @@ from pathlib import Path, PurePosixPath
 from semantic_terraform_agent.collectors.repository import RepositoryLayout
 from semantic_terraform_agent.config import DEFAULT_LIMITS
 from semantic_terraform_agent.models import (
+    PatchFailureCategory,
+    PatchFailureReasonCode,
     VerificationAttempt,
     VerificationCommand,
     VerificationCommands,
@@ -31,11 +34,26 @@ class UnsafePatchError(ValueError):
 
 
 @dataclass(frozen=True)
+class PatchFailureClassification:
+    category: PatchFailureCategory
+    reason_code: PatchFailureReasonCode
+    description: str
+
+
+@dataclass(frozen=True)
 class PatchInspection:
     affected_files: tuple[str, ...]
     creates_files: bool
     deletes_files: bool
     renames_files: bool
+
+
+_HUNK_HEADER = re.compile(
+    r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?: .*)?$"
+)
+_CONCATENATED_HEADERS = re.compile(
+    r"---\s+(?P<old>[^\s+]+)\+\+\+\s+(?P<new>[^\s@]+)@@"
+)
 
 
 def find_git() -> str | None:
@@ -104,6 +122,8 @@ def inspect_patch(patch: str) -> PatchInspection:
         raise UnsafePatchError("candidate patch contains ANSI escape codes")
     if any(line.strip().startswith("```") for line in patch.splitlines()):
         raise UnsafePatchError("candidate patch contains a Markdown fence")
+    if _CONCATENATED_HEADERS.search(patch):
+        raise UnsafePatchError("candidate patch contains concatenated diff headers")
     if "GIT binary patch" in patch or "Binary files " in patch:
         raise UnsafePatchError("binary patches are not supported")
 
@@ -150,6 +170,7 @@ def inspect_patch(patch: str) -> PatchInspection:
         raise UnsafePatchError("candidate patch is not a unified diff with ---/+++ headers")
     if not affected:
         raise UnsafePatchError("candidate patch does not identify a repository file")
+    _validate_hunk_structure(lines)
     return PatchInspection(
         affected_files=tuple(dict.fromkeys(affected)),
         creates_files=creates_files,
@@ -158,16 +179,45 @@ def inspect_patch(patch: str) -> PatchInspection:
     )
 
 
-def clean_candidate_patch(patch: str) -> str:
-    """Remove only one exact outer Markdown fence before scope validation."""
-    lines = patch.splitlines(keepends=True)
-    if len(lines) < 3:
-        return patch
-    opening = lines[0].strip().lower()
-    closing = lines[-1].strip()
-    if opening not in {"```", "```diff", "```patch"} or closing != "```":
-        return patch
-    return "".join(lines[1:-1])
+def _validate_hunk_structure(lines: list[str]) -> None:
+    hunk_count = 0
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if not line.startswith("@@"):
+            index += 1
+            continue
+        match = _HUNK_HEADER.fullmatch(line)
+        if match is None:
+            raise UnsafePatchError("candidate patch contains a malformed hunk header")
+        hunk_count += 1
+        expected_old = int(match.group(2) or 1)
+        expected_new = int(match.group(4) or 1)
+        actual_old = 0
+        actual_new = 0
+        index += 1
+        while index < len(lines):
+            body = lines[index]
+            if body.startswith(("@@", "diff --git ")) or (
+                body.startswith("--- ")
+                and index + 1 < len(lines)
+                and lines[index + 1].startswith("+++ ")
+            ):
+                break
+            if body.startswith("\\ No newline at end of file"):
+                index += 1
+                continue
+            if not body or body[0] not in {" ", "+", "-"}:
+                raise UnsafePatchError("candidate patch contains invalid unified-diff lines")
+            if body[0] in {" ", "-"}:
+                actual_old += 1
+            if body[0] in {" ", "+"}:
+                actual_new += 1
+            index += 1
+        if actual_old != expected_old or actual_new != expected_new:
+            raise UnsafePatchError("candidate patch hunk line counts do not match its body")
+    if hunk_count == 0:
+        raise UnsafePatchError("candidate patch contains no valid unified-diff hunk")
 
 
 def _format_patch_path(path: str, prefix: str) -> str:
@@ -276,7 +326,185 @@ def validate_patch_scope(patch: str, layout: RepositoryLayout) -> list[str]:
         raise UnsafePatchError("candidate patch does not identify a Terraform source file")
     if inspection.renames_files:
         raise UnsafePatchError("rename and copy patches are not supported")
+    if inspection.creates_files:
+        raise UnsafePatchError("file creation patches are not supported")
+    if inspection.deletes_files:
+        raise UnsafePatchError("file deletion patches are not supported")
+    for relative in dict.fromkeys(changed):
+        unresolved = layout.root / relative
+        if unresolved.is_symlink():
+            raise UnsafePatchError("patch may not modify a symbolic link")
+        if relative not in layout.terraform_files:
+            raise UnsafePatchError("patch may modify only existing Terraform source files")
     return list(dict.fromkeys(changed))
+
+
+def classify_patch_failure(
+    patch: str,
+    layout: RepositoryLayout,
+    error: str | Exception | None = None,
+) -> PatchFailureClassification:
+    """Classify patch representation and scope locally without model inference."""
+    message = str(error or "candidate patch failed validation")
+    lowered = message.lower()
+
+    if "git binary patch" in patch.lower() or "binary files " in patch.lower():
+        return _classification(PatchFailureCategory.UNSAFE, "binary_patch", message)
+    if any(marker in patch for marker in ("new file mode 120000", "new file mode 160000")):
+        return _classification(PatchFailureCategory.UNSAFE, "symlink_escape", message)
+    if any(marker in patch for marker in ("rename from ", "rename to ", "copy from ", "copy to ")):
+        return _classification(PatchFailureCategory.UNSAFE, "file_rename", message)
+    if "\x00" in patch or "\x1b" in patch or "backslashes" in lowered:
+        return _classification(PatchFailureCategory.UNSAFE, "unsafe_path", message)
+
+    raw_paths, creates, deletes, renames, path_error = _candidate_patch_paths(patch)
+    if path_error is not None:
+        return _classification(PatchFailureCategory.UNSAFE, "unsafe_path", path_error)
+    if creates:
+        return _classification(PatchFailureCategory.UNSAFE, "file_creation", message)
+    if deletes:
+        return _classification(PatchFailureCategory.UNSAFE, "file_deletion", message)
+    if renames:
+        return _classification(PatchFailureCategory.UNSAFE, "file_rename", message)
+    for raw in raw_paths:
+        try:
+            normalized = _normalize_patch_path(raw, layout)
+        except UnsafePatchError as exc:
+            reason: PatchFailureReasonCode = (
+                "non_terraform_path"
+                if "only terraform" in str(exc).lower()
+                else "unsafe_path"
+            )
+            return _classification(PatchFailureCategory.UNSAFE, reason, str(exc))
+        if normalized is None:
+            continue
+        unresolved = layout.root / normalized
+        if unresolved.is_symlink():
+            return _classification(
+                PatchFailureCategory.UNSAFE,
+                "symlink_escape",
+                "candidate patch targets a symbolic link",
+            )
+        if normalized not in layout.terraform_files:
+            return _classification(
+                PatchFailureCategory.UNSAFE,
+                "file_creation",
+                "candidate patch targets a file outside the existing Terraform manifest",
+            )
+
+    if "markdown fence" in lowered or any(
+        line.strip().startswith("```") for line in patch.splitlines()
+    ):
+        return _classification(
+            PatchFailureCategory.MALFORMED_REPAIRABLE,
+            "markdown_fence_leak",
+            message,
+        )
+    if "concatenated" in lowered or _CONCATENATED_HEADERS.search(patch):
+        return _classification(
+            PatchFailureCategory.MALFORMED_REPAIRABLE,
+            "concatenated_diff",
+            message,
+        )
+    if "hunk" in lowered:
+        return _classification(
+            PatchFailureCategory.MALFORMED_REPAIRABLE,
+            "malformed_hunk",
+            message,
+        )
+    if "unified-diff lines" in lowered or "line structure" in lowered:
+        return _classification(
+            PatchFailureCategory.MALFORMED_REPAIRABLE,
+            "invalid_diff_structure",
+            message,
+        )
+    if "not a unified diff" in lowered or "no valid unified-diff hunk" in lowered:
+        return _classification(
+            PatchFailureCategory.MALFORMED_REPAIRABLE,
+            "missing_diff_headers",
+            message,
+        )
+    if not raw_paths and any(marker in patch.lower() for marker in (".env", "readme")):
+        return _classification(
+            PatchFailureCategory.UNSAFE,
+            "non_terraform_path",
+            "candidate patch references a non-Terraform path",
+        )
+    if not raw_paths and any(marker in patch.lower() for marker in ("../", "/dev/null")):
+        return _classification(
+            PatchFailureCategory.UNSAFE,
+            "unsafe_path",
+            "candidate patch contains an unsafe path marker",
+        )
+    if not raw_paths:
+        return _classification(
+            PatchFailureCategory.MALFORMED_REPAIRABLE,
+            "missing_diff_headers",
+            message,
+        )
+    return _classification(
+        PatchFailureCategory.UNKNOWN,
+        "unknown_patch_failure",
+        message,
+    )
+
+
+def _candidate_patch_paths(
+    patch: str,
+) -> tuple[list[str], bool, bool, bool, str | None]:
+    paths: list[str] = []
+    creates = False
+    deletes = False
+    renames = False
+    lines = patch.splitlines()
+    for index, line in enumerate(lines):
+        if line.startswith("diff --git "):
+            try:
+                fields = shlex.split(line)
+            except ValueError:
+                return paths, creates, deletes, renames, "invalid quoted patch path header"
+            if len(fields) != 4:
+                return paths, creates, deletes, renames, "invalid diff --git path header"
+            paths.extend(fields[2:])
+            renames = renames or fields[2].removeprefix("a/") != fields[3].removeprefix("b/")
+        if not line.startswith("--- ") or index + 1 >= len(lines):
+            continue
+        plus = lines[index + 1]
+        if not plus.startswith("+++ "):
+            continue
+        old_path = line[4:].strip().split("\t", 1)[0]
+        new_path = plus[4:].strip().split("\t", 1)[0]
+        creates = creates or old_path == "/dev/null"
+        deletes = deletes or new_path == "/dev/null"
+        if old_path != "/dev/null":
+            paths.append(old_path)
+        if new_path != "/dev/null":
+            paths.append(new_path)
+        renames = renames or (
+            old_path != "/dev/null"
+            and new_path != "/dev/null"
+            and old_path.removeprefix("a/") != new_path.removeprefix("b/")
+        )
+    concatenated = _CONCATENATED_HEADERS.search(patch)
+    if concatenated:
+        paths.extend((concatenated.group("old"), concatenated.group("new")))
+        renames = renames or (
+            concatenated.group("old").removeprefix("a/")
+            != concatenated.group("new").removeprefix("b/")
+        )
+    return list(dict.fromkeys(paths)), creates, deletes, renames, None
+
+
+def _classification(
+    category: PatchFailureCategory,
+    reason_code: PatchFailureReasonCode,
+    description: str,
+) -> PatchFailureClassification:
+    return PatchFailureClassification(
+        category=category,
+        reason_code=reason_code,
+        description=description[:500],
+    )
 
 
 def _bounded_output(
@@ -397,6 +625,7 @@ def _attempt_result(
     commands: VerificationCommands,
     warnings: list[str],
     cleaned: bool = True,
+    failure: PatchFailureClassification | None = None,
 ) -> VerificationAttempt:
     return VerificationAttempt(
         attempt=attempt,
@@ -407,6 +636,9 @@ def _attempt_result(
         commands=commands,
         temporary_copy_cleaned=cleaned,
         warnings=warnings,
+        failure_category=failure.category if failure else None,
+        failure_reason_code=failure.reason_code if failure else None,
+        failure_description=failure.description if failure else None,
     )
 
 
@@ -438,6 +670,8 @@ _UNAVAILABLE_MARKERS = (
 
 
 def _environment_unavailable(command: VerificationCommand) -> bool:
+    if command.status == "error":
+        return True
     output = f"{command.stdout}\n{command.stderr}".lower()
     return any(marker in output for marker in _UNAVAILABLE_MARKERS)
 
@@ -448,11 +682,11 @@ def verify_candidate_patch(
     """Verify one candidate in a fresh filtered temporary repository copy."""
     commands = VerificationCommands()
     try:
-        patch = clean_candidate_patch(patch)
         changed_files = validate_patch_scope(patch, layout)
         patch = _canonicalize_patch_headers(patch, layout)
         changed_files = validate_patch_scope(patch, layout)
     except UnsafePatchError as exc:
+        failure = classify_patch_failure(patch, layout, exc)
         return _attempt_result(
             attempt=attempt,
             patch=patch,
@@ -461,6 +695,7 @@ def verify_candidate_patch(
             changed_files=[],
             commands=commands,
             warnings=[str(exc)],
+            failure=failure,
         )
 
     git = find_git()
@@ -476,6 +711,11 @@ def verify_candidate_patch(
             changed_files=changed_files,
             commands=commands,
             warnings=[reason],
+            failure=_classification(
+                PatchFailureCategory.ENVIRONMENT_FAILURE,
+                "environment_failure",
+                reason,
+            ),
         )
 
     warnings: list[str] = []
@@ -489,6 +729,7 @@ def verify_candidate_patch(
             patch_file = temp_root / "candidate.patch"
             patch_file.write_bytes(patch.encode("utf-8"))
         except OSError as exc:
+            reason = f"Could not create the isolated verification copy: {exc}"
             return _attempt_result(
                 attempt=attempt,
                 patch=patch,
@@ -496,7 +737,12 @@ def verify_candidate_patch(
                 failed_stage="patch_check",
                 changed_files=changed_files,
                 commands=commands,
-                warnings=[f"Could not create the isolated verification copy: {exc}"],
+                warnings=[reason],
+                failure=_classification(
+                    PatchFailureCategory.ENVIRONMENT_FAILURE,
+                    "environment_failure",
+                    reason,
+                ),
             )
         env = sanitized_environment(home)
 
@@ -507,16 +753,34 @@ def verify_candidate_patch(
             env=env,
         )
         if commands.patch_check.status != "passed":
-            reason = "Patch check did not pass; later verification commands were not run."
+            unavailable = _environment_unavailable(commands.patch_check)
+            reason = (
+                "Patch check could not run in the current environment."
+                if unavailable
+                else "Patch check did not pass; later verification commands were not run."
+            )
+            failure = _classification(
+                (
+                    PatchFailureCategory.ENVIRONMENT_FAILURE
+                    if unavailable
+                    else PatchFailureCategory.SEMANTIC_VERIFICATION_FAILURE
+                ),
+                "environment_failure" if unavailable else "patch_does_not_apply",
+                _bounded_output(
+                    f"{commands.patch_check.stderr}\n{commands.patch_check.stdout}"
+                )
+                or reason,
+            )
             _skip_after(commands, "patch_apply", reason)
             return _attempt_result(
                 attempt=attempt,
                 patch=patch,
-                status="failed",
+                status="unavailable" if unavailable else "failed",
                 failed_stage="patch_check",
                 changed_files=changed_files,
                 commands=commands,
                 warnings=[reason],
+                failure=failure,
             )
 
         commands.patch_apply = _run_command(
@@ -526,16 +790,30 @@ def verify_candidate_patch(
             env=env,
         )
         if commands.patch_apply.status != "passed":
-            reason = "Patch application did not pass; Terraform verification was not run."
+            unavailable = _environment_unavailable(commands.patch_apply)
+            reason = (
+                "Patch application could not run in the current environment."
+                if unavailable
+                else "Patch application did not pass; Terraform verification was not run."
+            )
             _skip_after(commands, "fmt", reason)
             return _attempt_result(
                 attempt=attempt,
                 patch=patch,
-                status="failed",
+                status="unavailable" if unavailable else "failed",
                 failed_stage="patch_apply",
                 changed_files=changed_files,
                 commands=commands,
                 warnings=[reason],
+                failure=_classification(
+                    (
+                        PatchFailureCategory.ENVIRONMENT_FAILURE
+                        if unavailable
+                        else PatchFailureCategory.SEMANTIC_VERIFICATION_FAILURE
+                    ),
+                    "environment_failure" if unavailable else "patch_does_not_apply",
+                    reason,
+                ),
             )
 
         terraform = find_terraform()
@@ -550,6 +828,11 @@ def verify_candidate_patch(
                 changed_files=changed_files,
                 commands=commands,
                 warnings=[reason],
+                failure=_classification(
+                    PatchFailureCategory.ENVIRONMENT_FAILURE,
+                    "environment_failure",
+                    reason,
+                ),
             )
 
         commands.fmt = _run_command(
@@ -559,16 +842,34 @@ def verify_candidate_patch(
             env=env,
         )
         if commands.fmt.status != "passed":
-            reason = "terraform fmt -check did not pass."
+            unavailable = _environment_unavailable(commands.fmt)
+            reason = (
+                "terraform fmt -check could not run in the current environment."
+                if unavailable
+                else "terraform fmt -check did not pass."
+            )
             _skip_after(commands, "init", reason)
             return _attempt_result(
                 attempt=attempt,
                 patch=patch,
-                status="failed",
+                status="unavailable" if unavailable else "failed",
                 failed_stage="fmt",
                 changed_files=changed_files,
                 commands=commands,
                 warnings=[reason],
+                failure=_classification(
+                    (
+                        PatchFailureCategory.ENVIRONMENT_FAILURE
+                        if unavailable
+                        else PatchFailureCategory.SEMANTIC_VERIFICATION_FAILURE
+                    ),
+                    (
+                        "environment_failure"
+                        if unavailable
+                        else "terraform_verification_failure"
+                    ),
+                    reason,
+                ),
             )
 
         commands.init = _run_command(
@@ -601,6 +902,19 @@ def verify_candidate_patch(
                 changed_files=changed_files,
                 commands=commands,
                 warnings=[reason],
+                failure=_classification(
+                    (
+                        PatchFailureCategory.ENVIRONMENT_FAILURE
+                        if unavailable
+                        else PatchFailureCategory.UNKNOWN
+                    ),
+                    (
+                        "environment_failure"
+                        if unavailable
+                        else "unknown_patch_failure"
+                    ),
+                    reason,
+                ),
             )
 
         commands.terraform_validate = _run_command(
@@ -610,16 +924,34 @@ def verify_candidate_patch(
             env=env,
         )
         if commands.terraform_validate.status != "passed":
-            reason = "terraform validate did not pass; plan was not run."
+            unavailable = _environment_unavailable(commands.terraform_validate)
+            reason = (
+                "terraform validate could not run in the current environment."
+                if unavailable
+                else "terraform validate did not pass; plan was not run."
+            )
             _skip_after(commands, "plan", reason)
             return _attempt_result(
                 attempt=attempt,
                 patch=patch,
-                status="failed",
+                status="unavailable" if unavailable else "failed",
                 failed_stage="validate",
                 changed_files=changed_files,
                 commands=commands,
                 warnings=[reason],
+                failure=_classification(
+                    (
+                        PatchFailureCategory.ENVIRONMENT_FAILURE
+                        if unavailable
+                        else PatchFailureCategory.SEMANTIC_VERIFICATION_FAILURE
+                    ),
+                    (
+                        "environment_failure"
+                        if unavailable
+                        else "terraform_verification_failure"
+                    ),
+                    reason,
+                ),
             )
 
         commands.plan = _run_command(
@@ -657,6 +989,19 @@ def verify_candidate_patch(
                 changed_files=changed_files,
                 commands=commands,
                 warnings=[reason],
+                failure=_classification(
+                    (
+                        PatchFailureCategory.ENVIRONMENT_FAILURE
+                        if unavailable
+                        else PatchFailureCategory.SEMANTIC_VERIFICATION_FAILURE
+                    ),
+                    (
+                        "environment_failure"
+                        if unavailable
+                        else "terraform_verification_failure"
+                    ),
+                    reason,
+                ),
             )
 
         return _attempt_result(

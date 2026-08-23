@@ -54,6 +54,34 @@ class VerificationErrorRelation(str, Enum):
     UNKNOWN = "unknown"
 
 
+class PatchFailureCategory(str, Enum):
+    MALFORMED_REPAIRABLE = "malformed_repairable"
+    UNSAFE = "unsafe"
+    SEMANTIC_VERIFICATION_FAILURE = "semantic_verification_failure"
+    ENVIRONMENT_FAILURE = "environment_failure"
+    UNKNOWN = "unknown"
+
+
+PatchFailureReasonCode: TypeAlias = Literal[
+    "missing_diff_headers",
+    "malformed_hunk",
+    "markdown_fence_leak",
+    "concatenated_diff",
+    "invalid_diff_structure",
+    "unsafe_path",
+    "non_terraform_path",
+    "binary_patch",
+    "symlink_escape",
+    "file_creation",
+    "file_deletion",
+    "file_rename",
+    "patch_does_not_apply",
+    "terraform_verification_failure",
+    "environment_failure",
+    "unknown_patch_failure",
+]
+
+
 EscalationReasonCode: TypeAlias = Literal[
     "verification_passed",
     "provider_constraint_unresolved",
@@ -67,6 +95,7 @@ EscalationReasonCode: TypeAlias = Literal[
     "formatting_failure",
     "syntactic_patch_failure",
     "patch_check_failure",
+    "malformed_patch",
     "patch_apply_failure",
     "unsafe_patch",
     "environment_unavailable",
@@ -375,9 +404,12 @@ class ContextProgression(StrictModel):
     signals: list[str] = Field(default_factory=list, max_length=8)
     verification_error_relation: VerificationErrorRelation | None = None
     second_attempt_reason: SecondAttemptReason = SecondAttemptReason.NONE
+    repair_reason: str | None = None
+    stop_reason: str | None = None
     schema_retrieval_attempted: bool = False
     schema_retrieved: bool = False
     schema_avoided: bool | None = None
+    schema_avoidance_reason: str | None = None
     same_model: bool = True
     initial_input_tokens: int | None = Field(default=None, ge=0)
     escalation_input_tokens: int | None = Field(default=None, ge=0)
@@ -468,6 +500,9 @@ class VerificationAttempt(StrictModel):
     temporary_copy_cleaned: bool
     warnings: list[str] = Field(default_factory=list)
     candidate_source: Literal["llm", "verified_failure_memory"] = "llm"
+    failure_category: PatchFailureCategory | None = None
+    failure_reason_code: PatchFailureReasonCode | None = None
+    failure_description: str | None = Field(default=None, max_length=500)
 
 
 class SourceProvenance(StrictModel):
@@ -545,6 +580,7 @@ class Diagnosis(StrictModel):
     evidence_score: float
     verification: VerificationSignal
     second_attempt_reason: SecondAttemptReason = SecondAttemptReason.NONE
+    repair_reason: str | None = None
 
 
 class TokenUsage(StrictModel):
@@ -571,6 +607,7 @@ class LLMInvocation(StrictModel):
     routing_tier: ModelTier | None = None
     routing_reason: RoutingReasonCode | None = None
     call_number: int | None = Field(default=None, ge=1, le=2)
+    repair_reason: str | None = None
     prompt_characters: int = Field(ge=0)
     system_prompt_characters: int = Field(ge=0)
     user_prompt_characters: int = Field(ge=0)
@@ -619,6 +656,7 @@ class ContextSectionTelemetry(StrictModel):
 
 class ContextCallTelemetry(StrictModel):
     call_type: LLMCallType
+    repair_reason: str | None = None
     context_level: ContextLevel | None = None
     prompt_characters: int = Field(ge=0)
     system_prompt_characters: int = Field(ge=0)
@@ -653,6 +691,7 @@ class RepairRequest(StrictModel):
     failed_attempt: VerificationAttempt
     second_attempt_reason: SecondAttemptReason = SecondAttemptReason.REPAIR
     escalation_decision: EscalationDecision | None = None
+    repair_reason: str | None = None
 
 
 class ProviderResponse(StrictModel):

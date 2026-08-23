@@ -9,6 +9,7 @@ from semantic_terraform_agent.models import (
     ModelDefinition,
     ModelDiagnosis,
     ModelTier,
+    PatchFailureCategory,
     ProviderResponse,
     ProviderFailureCategory,
     SchemaRecord,
@@ -276,7 +277,7 @@ def test_context_escalation_independently_routes_to_next_tier(
     assert len(result.llm_calls) == 2
 
 
-def test_formatting_repair_stays_on_initial_model(
+def test_malformed_patch_repair_stays_on_initial_free_model_and_tier(
     terraform_repo: Path,
     failure_log: Path,
     diff_file: Path,
@@ -287,14 +288,22 @@ def test_formatting_repair_stays_on_initial_model(
     monkeypatch.setattr(
         "semantic_terraform_agent.orchestration.diagnose.inspect_schemas",
         lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("format repair must not retrieve schema")
+            AssertionError("malformed patch repair must not retrieve schema")
         ),
     )
 
     def verifier(patch, layout, *, attempt):
         events.append(f"verify:{attempt}")
         if attempt == 1:
-            return _attempt(patch, attempt, status="failed", stage="fmt")
+            return _attempt(
+                patch, attempt, status="rejected", stage="patch_check"
+            ).model_copy(
+                update={
+                    "failure_category": PatchFailureCategory.MALFORMED_REPAIRABLE,
+                    "failure_reason_code": "concatenated_diff",
+                    "failure_description": "headers were concatenated",
+                }
+            )
         return _attempt(patch, attempt, status="verified")
 
     result = _run(terraform_repo, failure_log, diff_file, factory, verifier)
@@ -306,6 +315,9 @@ def test_formatting_repair_stays_on_initial_model(
     ]
     assert result.model_progression.decisions[1].reason_code == "repair_same_model"
     assert result.model_progression.model_escalated is False
+    assert result.model_progression.initial_tier is ModelTier.FREE
+    assert result.model_progression.final_tier is ModelTier.FREE
+    assert result.llm_calls[1].repair_reason == "malformed_patch"
     assert result.context_progression.levels_used == ["minimal"]
 
 

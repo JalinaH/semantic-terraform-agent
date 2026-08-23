@@ -12,6 +12,7 @@ from semantic_terraform_agent.models import (
     DiagnosisContext,
     FailureInfo,
     ModelDiagnosis,
+    PatchFailureCategory,
     VerificationAttempt,
     VerificationCommand,
     VerificationCommands,
@@ -90,6 +91,8 @@ def _attempt(
     status: str = "failed",
     stage: str | None = "plan",
     output: str = "",
+    failure_category: PatchFailureCategory | None = None,
+    failure_reason_code: str | None = None,
 ) -> VerificationAttempt:
     command = VerificationCommand(
         command=["terraform", stage or "plan"],
@@ -112,6 +115,8 @@ def _attempt(
         commands=commands,
         temporary_copy_cleaned=True,
         warnings=[] if status == "verified" else ["verification failed"],
+        failure_category=failure_category,
+        failure_reason_code=failure_reason_code,
     )
 
 
@@ -193,6 +198,29 @@ def test_rejected_patch_and_patch_apply_failure_never_escalate() -> None:
     assert rejected.action == "stop"
     assert apply_failure.reason_code == "patch_apply_failure"
     assert apply_failure.action == "stop"
+
+
+def test_repairable_malformed_patch_consumes_repair_but_unsafe_patch_stops() -> None:
+    malformed = _decide(
+        _attempt(
+            status="rejected",
+            stage="patch_check",
+            failure_category=PatchFailureCategory.MALFORMED_REPAIRABLE,
+            failure_reason_code="concatenated_diff",
+        )
+    )
+    unsafe = _decide(
+        _attempt(
+            status="rejected",
+            stage="patch_check",
+            failure_category=PatchFailureCategory.UNSAFE,
+            failure_reason_code="unsafe_path",
+        )
+    )
+    assert malformed.action == "repair"
+    assert malformed.reason_code == "malformed_patch"
+    assert unsafe.action == "stop"
+    assert unsafe.reason_code == "unsafe_patch"
 
 
 def test_ambiguity_and_relevant_unresolved_symbol_can_escalate_unknown_plan() -> None:

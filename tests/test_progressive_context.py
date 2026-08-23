@@ -209,6 +209,9 @@ def test_auto_first_pass_success_avoids_schema_and_second_call(
     assert result.context_progression.final_level.value == "minimal"
     assert result.context_progression.escalated is False
     assert result.context_progression.schema_avoided is True
+    assert result.context_progression.schema_avoidance_reason == (
+        "successful_minimal_verification"
+    )
     assert result.context_progression.schema_retrieved is False
     assert result.context_progression.second_attempt_reason.value == "none"
     assert result.llm_usage.call_count == 1
@@ -273,6 +276,9 @@ Argument "mode" must be one of "safe" or "slow".''',
     assert result.context_progression.schema_retrieval_attempted is True
     assert result.context_progression.schema_retrieved is True
     assert result.context_progression.schema_avoided is False
+    assert result.context_progression.schema_avoidance_reason == (
+        "schema_retrieved"
+    )
     assert result.context_progression.same_model is True
     assert result.diagnosis.second_attempt_reason.value == "context_escalation"
     assert result.diagnosis.verification_status == "verified_after_retry"
@@ -335,6 +341,9 @@ def test_auto_fmt_failure_repairs_with_minimal_context_and_no_schema(
     ).user
     assert result.context_progression.escalated is False
     assert result.context_progression.schema_avoided is True
+    assert result.context_progression.schema_avoidance_reason == (
+        "successful_minimal_verification"
+    )
     assert result.diagnosis.second_attempt_reason.value == "repair"
     assert [call.context_level.value for call in result.llm_calls] == [
         "minimal",
@@ -375,7 +384,10 @@ def test_environment_failure_stops_without_schema_or_second_model(
     assert events == ["diagnose", "verify_1"]
     assert provider.repair_calls == 0
     assert result.context_progression.reason_code == "credentials_unavailable"
-    assert result.context_progression.schema_avoided is True
+    assert result.context_progression.schema_avoided is None
+    assert result.context_progression.schema_avoidance_reason == (
+        "verification_stopped_before_schema_decision"
+    )
     assert result.diagnosis.verification_status == "verification_unavailable"
 
 
@@ -416,7 +428,10 @@ def test_schema_unavailable_after_semantic_signal_stops_without_unchanged_rerun(
     assert result.context_progression.reason_code == "schema_unavailable"
     assert result.context_progression.schema_retrieval_attempted is True
     assert result.context_progression.schema_retrieved is False
-    assert result.context_progression.schema_avoided is False
+    assert result.context_progression.schema_avoided is None
+    assert result.context_progression.schema_avoidance_reason == (
+        "verification_not_successful"
+    )
     assert result.llm_usage.call_count == 1
 
 
@@ -525,3 +540,7 @@ def test_progressive_second_failure_never_creates_a_third_call(
     assert len(result.llm_calls) == 2
     assert len(result.diagnosis.attempts) == 2
     assert result.diagnosis.verification_status == "verification_failed"
+    assert result.context_progression.schema_avoided is None
+    assert result.context_progression.schema_avoidance_reason == (
+        "verification_not_successful"
+    )

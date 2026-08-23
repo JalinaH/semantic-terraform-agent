@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.1.1
+
+- Classify patch failures deterministically as repairable malformed, unsafe,
+  semantic verification, environment, or unknown failures.
+- Allow malformed unified-diff serialization to consume the existing bounded
+  same-model repair call without schema escalation.
+- Preserve terminal behavior for unsafe paths, files, operations, binary patches,
+  and symlink targets.
+- Report schema avoidance only after successful minimal-context verification.
+
 ## 1.1.0
 
 - Added a stable verified-patch artifact with exact UTF-8 SHA-256 provenance.

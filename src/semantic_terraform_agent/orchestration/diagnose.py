@@ -70,6 +70,7 @@ from semantic_terraform_agent.models import (
     ModelProgression,
     ModelRoutingMode,
     ModelTier,
+    PatchFailureCategory,
     RepairRequest,
     RepositoryInfo,
     ResultDocument,
@@ -189,6 +190,9 @@ def _unavailable_attempt(
         commands=VerificationCommands(),
         temporary_copy_cleaned=False,
         warnings=[f"Patch verifier could not complete: {error}"],
+        failure_category=PatchFailureCategory.ENVIRONMENT_FAILURE,
+        failure_reason_code="environment_failure",
+        failure_description="Patch verifier could not complete in the current environment.",
     )
 
 
@@ -292,7 +296,7 @@ def diagnose_repository(
     cache_store: LocalCacheStore | None = None,
 ) -> ResultDocument:
     if max_repair_attempts not in (0, 1):
-        raise InputError("max_repair_attempts must be 0 or 1 in version 1.1.0")
+        raise InputError("max_repair_attempts must be 0 or 1 in version 1.1.1")
     selected_provider = parse_provider_name(provider_name)
     total_start = time.perf_counter()
     timing: dict[str, float] = {
@@ -535,6 +539,11 @@ def diagnose_repository(
                         schema_retrieval_attempted=False,
                         schema_retrieved=False,
                         schema_avoided=True if context_mode == "auto" else None,
+                        schema_avoidance_reason=(
+                            "successful_minimal_verification"
+                            if context_mode == "auto"
+                            else None
+                        ),
                         initial_input_tokens=0,
                         total_input_tokens=0,
                     )
@@ -872,6 +881,7 @@ def diagnose_repository(
         attempts[0] = first_attempt
 
     second_attempt_reason = SecondAttemptReason.NONE
+    repair_reason: str | None = None
     if decision.action == "escalate":
         retrieve_schema()
         if schema_retrieved:
@@ -901,6 +911,12 @@ def diagnose_repository(
             )
     elif decision.action == "repair":
         second_attempt_reason = SecondAttemptReason.REPAIR
+        repair_reason = (
+            "malformed_patch"
+            if first_attempt.failure_category
+            is PatchFailureCategory.MALFORMED_REPAIRABLE
+            else decision.reason_code
+        )
 
     repair_error: str | None = None
     if second_attempt_reason is not SecondAttemptReason.NONE:
@@ -943,6 +959,7 @@ def diagnose_repository(
                 if second_attempt_reason is SecondAttemptReason.CONTEXT_ESCALATION
                 else None
             ),
+            repair_reason=repair_reason,
         )
         repair_prompt = build_repair_prompt_parts(repair_request)
         started = time.perf_counter()
@@ -967,6 +984,7 @@ def diagnose_repository(
                 latency_ms=round(timing["second_llm_seconds"] * 1000),
                 context_level=active_request.context_level,
                 routing_decision=second_routing,
+                repair_reason=repair_reason,
             )
             llm_calls.append(repair_invocation)
             prompt_records.append((repair_invocation, repair_prompt, active_request))
@@ -1025,6 +1043,7 @@ def diagnose_repository(
             verification_status, final_attempt, reason=repair_error
         ),
         second_attempt_reason=second_attempt_reason,
+        repair_reason=repair_reason,
     )
 
     llm_usage = aggregate_usage(llm_calls)
@@ -1139,10 +1158,35 @@ def diagnose_repository(
         signals=decision.signals,
         verification_error_relation=decision.verification_error_relation,
         second_attempt_reason=second_attempt_reason,
+        repair_reason=repair_reason,
+        stop_reason=(decision.reason_code if decision.action == "stop" else None),
         schema_retrieval_attempted=schema_retrieval_attempted,
         schema_retrieved=schema_retrieved,
         schema_avoided=(
-            not schema_retrieval_attempted if context_mode == "auto" else None
+            (not schema_retrieval_attempted)
+            if context_mode == "auto"
+            and verification_status
+            in {"verified_first_attempt", "verified_after_retry"}
+            else None
+        ),
+        schema_avoidance_reason=(
+            (
+                "successful_minimal_verification"
+                if not schema_retrieval_attempted
+                else "schema_retrieved"
+            )
+            if context_mode == "auto"
+            and verification_status
+            in {"verified_first_attempt", "verified_after_retry"}
+            else (
+                (
+                    "verification_not_successful"
+                    if schema_retrieval_attempted
+                    else "verification_stopped_before_schema_decision"
+                )
+                if context_mode == "auto"
+                else None
+            )
         ),
         same_model=same_model,
         initial_input_tokens=llm_usage.initial_input_tokens,

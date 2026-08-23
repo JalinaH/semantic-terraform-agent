@@ -189,12 +189,21 @@ def _print_summary(result: ResultDocument, output: Path) -> None:
     )
     first = diagnosis.attempts[0]
     first_description = first.status
-    if first.failed_stage:
+    if (
+        first.failure_category is not None
+        and first.failure_category.value == "malformed_repairable"
+    ):
+        first_description = "Patch format invalid"
+    elif first.failed_stage:
         first_description = f"verification failed at {_stage_label(first.failed_stage)}"
-    print("Initial patch:")
+    print("Initial candidate:")
     print(f"  {first_description}")
-    print("Repair attempt:")
-    print("  generated" if diagnosis.repair else "  not generated")
+    print("Repair:")
+    if diagnosis.repair and diagnosis.repair_reason == "malformed_patch":
+        repaired = diagnosis.verification_status == "verified_after_retry"
+        print("  Generated valid unified diff" if repaired else "  Generated, but still invalid")
+    else:
+        print("  generated" if diagnosis.repair else "  not generated")
     progression = result.context_progression
     if progression is not None:
         print("Progressive context:")

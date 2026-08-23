@@ -4,7 +4,7 @@ Semantic Terraform Agent diagnoses Terraform CI failures, generates a candidate 
 and verifies that patch in an isolated temporary workspace. It supports arbitrary
 Terraform repositories and does not contain benchmark-specific resource logic.
 
-Version: `1.1.0`
+Version: `1.1.1`
 
 ## How it works
 
@@ -166,6 +166,28 @@ On successful warm reuse, `resolution_source` is `verified_failure_memory`, `llm
 is empty, and current-run model usage is zero. Historical avoided usage is reported only
 when authoritative prior telemetry exists.
 
+### Patch-failure classification and bounded repair
+
+Version 1.1.1 classifies every rejected or failed candidate deterministically as
+`malformed_repairable`, `unsafe`, `semantic_verification_failure`,
+`environment_failure`, or `unknown`. Machine-readable reason codes distinguish cases
+such as missing headers, concatenated diff serialization, Markdown-fence leakage,
+unsafe paths, unsupported file operations, a patch that does not apply, and Terraform
+verification failures.
+
+Only a representation-level `malformed_repairable` result can use the one existing
+second model call. That call keeps the same model and tier, preserves the diagnosed
+change and affected-file scope, and asks only for a valid unified diff. It does not
+retrieve schema merely to fix diff formatting. Unsafe candidates stop immediately;
+there is no third call or model-hopping loop. A repaired candidate must pass the entire
+isolated verification pipeline and only the repaired final patch may be hashed, cached,
+or considered mutation-eligible.
+
+For auto context, `context_progression.schema_avoided` is `true` only when a run
+finishes with successful minimal-context verification without schema retrieval. It is
+`false` for a successful schema-backed run and `null` when verification did not succeed
+or the comparison is not applicable. `schema_avoidance_reason` records that distinction.
+
 ## Safety guarantees
 
 The agent never runs `terraform apply`, `terraform destroy`, `terraform import`,
@@ -192,7 +214,7 @@ The production workflow is:
 ```yaml
 jobs:
   diagnose:
-    uses: JalinaH/semantic-terraform-agent/.github/workflows/terraform-agent.yml@v1.1.0
+    uses: JalinaH/semantic-terraform-agent/.github/workflows/terraform-agent.yml@v1.1.1
     permissions:
       contents: read
       id-token: write
