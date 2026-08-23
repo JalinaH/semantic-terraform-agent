@@ -174,10 +174,9 @@ def _stage_label(stage: str) -> str:
 def _print_summary(result: ResultDocument, output: Path) -> None:
     assert result.diagnosis and result.context and result.failure
     diagnosis = result.diagnosis
-    final_candidate = diagnosis.repair or diagnosis.initial
-    affected = ", ".join(final_candidate.affected_resources) or "not identified"
+    affected = ", ".join(diagnosis.initial.affected_resources) or "not identified"
     print("Root cause:")
-    print(f"  {final_candidate.root_cause}")
+    print(f"  {diagnosis.initial.root_cause}")
     print("Affected resources:")
     print(f"  {affected}")
     print(
@@ -196,12 +195,17 @@ def _print_summary(result: ResultDocument, output: Path) -> None:
         first_description = "Patch format invalid"
     elif first.failed_stage:
         first_description = f"verification failed at {_stage_label(first.failed_stage)}"
-    print("Initial candidate:")
+    print("Candidate:")
     print(f"  {first_description}")
+    if diagnosis.candidate_representation == "structured_edit":
+        print("  Structured edit generated")
+        if diagnosis.patch_construction is not None and diagnosis.final_patch:
+            print("  Deterministic unified diff built")
     print("Repair:")
-    if diagnosis.repair and diagnosis.repair_reason == "malformed_patch":
+    if diagnosis.repair and diagnosis.repair_reason == "malformed_patch_to_structured_edit":
         repaired = diagnosis.verification_status == "verified_after_retry"
-        print("  Generated valid unified diff" if repaired else "  Generated, but still invalid")
+        print("  Malformed candidate converted to structured edit")
+        print("  verified" if repaired else "  rejected")
     else:
         print("  generated" if diagnosis.repair else "  not generated")
     progression = result.context_progression

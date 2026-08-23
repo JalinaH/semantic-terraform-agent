@@ -31,12 +31,12 @@ def test_offline_progressive_comparison_is_deterministic_and_never_fakes_usage(
         row["initial_prompt_characters"]
         for row in rows
         if row["strategy"] == "progressive"
-    ] == [2_404, 2_528, 2_130]
+    ] == [2_528, 2_652, 2_254]
     assert [
         row["schema_escalation_prompt_characters"]
         for row in rows
         if row["strategy"] == "progressive"
-    ] == [3_941, 3_973, 3_406]
+    ] == [3_630, 3_662, 3_095]
     assert all(row["input_tokens"] is None for row in rows)
     assert all(row["cost_usd"] is None for row in rows)
     assert all(

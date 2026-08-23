@@ -82,10 +82,11 @@ def build_prompt_parts(request: DiagnosisRequest) -> PromptParts:
 Use only the evidence supplied below. Do not invent files, resource addresses, provider
 constraints, or successful verification. Critical Terraform source and diff lines are
 exact excerpts; a section explicitly marked truncated is incomplete. Return a minimal
-candidate patch as a unified diff when the evidence supports one. Use the exact
-repository-relative paths shown below, with `a/` and `b/` prefixes in patch headers.
-Every hunk header's old/new line counts must exactly match its context, removed, and added
-lines. Never suggest running terraform apply or destroy.
+candidate as structured exact-source edits when the evidence supports one. Each edit must
+contain only file, old_text, and new_text. Use exact repository-relative Terraform paths
+and exact source excerpts. Do not generate unified-diff headers (`---`, `+++`, or `@@`);
+the agent constructs the Git patch deterministically. Never suggest running terraform
+apply or destroy. Set suggested_patch to null for the normal structured-edit path.
 
 Return JSON matching the supplied response schema. Evidence source must be one of:
 terraform_error, terraform_source, git_diff, provider_schema. Confidence is your model
@@ -116,7 +117,7 @@ def build_repair_prompt_parts(request: RepairRequest) -> PromptParts:
         return _build_legacy_repair_prompt_parts(request)
 
     previous = request.previous_diagnosis.model_dump(
-        mode="json", exclude={"suggested_patch"}
+        mode="json", exclude={"suggested_patch", "edits"}
     )
     sections: dict[str, str] = {
         "terraform_error": _render_failure(context.failure),
@@ -134,7 +135,15 @@ def build_repair_prompt_parts(request: RepairRequest) -> PromptParts:
             + json.dumps(previous, separators=(",", ":"), sort_keys=True)
         ),
         "original_patch": (
-            "ORIGINAL CANDIDATE PATCH\n" + request.previous_diagnosis.suggested_patch
+            "ORIGINAL CANDIDATE REPRESENTATION\n"
+            + (
+                request.previous_diagnosis.suggested_patch
+                or json.dumps(
+                    {"edits": [edit.model_dump() for edit in request.previous_diagnosis.edits]},
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+            )
         ),
         "verification_evidence": _render_verification_evidence(request),
         "patch_failure": _render_patch_failure(request),
@@ -142,33 +151,28 @@ def build_repair_prompt_parts(request: RepairRequest) -> PromptParts:
         "metadata": _render_metadata(request.original),
         "provider_schema": _render_schema(request.original),
     }
-    if request.repair_reason == "malformed_patch":
-        opening = """The Terraform diagnosis is already complete, but the candidate patch
-was rejected because its unified-diff representation is malformed. Preserve the diagnosed
-change and all intended file scope. Correct only the patch serialization needed to produce
-a valid unified diff. Do not rediagnose the Terraform failure, change the intended fix, or
-modify additional files."""
+    if request.repair_reason == "malformed_patch_to_structured_edit":
+        opening = """The Terraform diagnosis is already complete, but its legacy unified
+diff is malformed. Convert only the intended change into corrected structured exact-source
+edits. Do not serialize another unified diff."""
+    elif request.repair_reason == "structured_edit_repair":
+        opening = """The Terraform diagnosis is already complete, but deterministic edit
+construction rejected the candidate. Correct only the structured exact-source edits."""
     elif request.second_attempt_reason.value == "context_escalation":
-        opening = """The first candidate did not pass Terraform verification. Additional
-deterministically selected provider-schema context is now available. Revise the diagnosis
-and produce one final candidate patch that addresses the verification evidence."""
+        opening = """The immutable Terraform diagnosis remains authoritative. Additional
+deterministically selected provider-schema context is available. Return only corrected
+structured edits that address the verification evidence."""
     else:
-        opening = """The previous candidate patch did not pass Terraform verification.
-Produce one revised patch that addresses the verification evidence while preserving the
-intended root-cause fix."""
+        opening = """The immutable Terraform diagnosis remains authoritative. Return only
+corrected structured edits that address the verification evidence."""
     system = f"""{opening}
 
-Use only the evidence supplied below. Preserve the original diagnosis unless verification
-directly contradicts it. Return a complete diagnosis using the same strict JSON response
-schema, with a minimal unified diff in suggested_patch. Critical Terraform source and diff
-lines are exact excerpts. Use the exact repository-relative paths shown below, with `a/`
-and `b/` patch prefixes and exact hunk line counts. Never suggest terraform apply or
-destroy. Only one bounded second attempt is allowed.
-
-Evidence source must be one of terraform_error, terraform_source, git_diff,
-provider_schema. Confidence remains a model estimate between 0 and 1, not a verification
-result. Return only the JSON response with no Markdown fence, preamble, or trailing
-commentary."""
+Use only the evidence supplied below. Do not rediagnose the Terraform failure. Do not
+return root_cause, affected_resources, violated_constraint, confidence, evidence,
+suggested_patch, explanation, Markdown, or unified-diff syntax. Return exactly one JSON
+object with an `edits` array; each edit contains only `file`, `old_text`, and `new_text`.
+Use exact source text and existing Terraform files only. Do not add files. Only one bounded
+second attempt is allowed."""
     return _parts_from_sections(
         system,
         sections,
@@ -378,30 +382,12 @@ def _build_legacy_repair_prompt_parts(request: RepairRequest) -> PromptParts:
         ),
     }
     encoded = redact_secrets(json.dumps(payload, indent=2, sort_keys=True))
-    system = """The previous candidate patch did not pass Terraform verification. Produce
-one revised patch that addresses the verification evidence while preserving the intended
-root-cause fix.
-
-Use only the evidence supplied below. Preserve the original diagnosis unless the
-verification evidence directly contradicts it. Return a complete diagnosis using the same
-strict JSON response schema, with a minimal unified diff in suggested_patch. Do not invent
-successful verification. Use the exact repository-relative paths shown in
-relevant_terraform_source, with `a/` and `b/` prefixes in patch headers. Every hunk
-header's old/new line counts must exactly match its context, removed, and added lines.
-Never suggest terraform apply or destroy.
-
-Only one bounded second attempt is allowed. Evidence source must be one of: terraform_error,
-terraform_source, git_diff, provider_schema. Confidence remains a model estimate between
-0 and 1, not a verification result.
-
-Return only the JSON response with no Markdown fence, preamble, or trailing commentary."""
-    if request.repair_reason == "malformed_patch":
-        system = """The Terraform diagnosis is already complete. Correct only the malformed
-unified-diff representation in suggested_patch. Preserve the diagnosed change, intended
-values, repository-relative Terraform file scope, and all other diagnosis fields. Do not
-rediagnose the failure or modify additional files. Return the same strict JSON response
-schema with suggested_patch containing only a valid unified diff, without Markdown fences
-or explanation text. Only one bounded second attempt is allowed."""
+    system = """The first Terraform diagnosis is immutable and authoritative. Return only
+corrected structured exact-source edits for the existing Terraform files shown in the
+context. Do not rediagnose the failure. Do not return diagnosis fields, explanation,
+Markdown, suggested_patch, or unified-diff syntax (`---`, `+++`, `@@`). Return exactly one
+JSON object with an `edits` array; each edit contains only file, old_text, and new_text.
+Only one bounded second attempt is allowed."""
     return PromptParts(
         system=system,
         user=f"""REPAIR CONTEXT

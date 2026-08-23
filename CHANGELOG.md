@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.1.2
+
+- Preserve the first-pass semantic diagnosis as immutable throughout repair,
+  escalation, result serialization, and verified-memory persistence.
+- Add a bounded structured semantic edit contract for existing Terraform files.
+- Construct unified diffs deterministically with Git from exact source replacements.
+- Convert malformed legacy diffs through an edit-only repair response instead of
+  asking the model to serialize another patch.
+- Reduce repair output surface and retain the exact verified patch as the reusable
+  provenance and cache artifact.
+
 ## 1.1.1
 
 - Classify patch failures deterministically as repairable malformed, unsafe,

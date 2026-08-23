@@ -15,7 +15,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from semantic_terraform_agent.config import ProviderError, validate_model_id
+from semantic_terraform_agent.config import DEFAULT_LIMITS, ProviderError, validate_model_id
 from semantic_terraform_agent.models import (
     DiagnosisRequest,
     LLMCallType,
@@ -25,6 +25,7 @@ from semantic_terraform_agent.models import (
     ProviderFailureCategory,
     ProviderResponse,
     RepairRequest,
+    SemanticEditSet,
     TokenUsage,
 )
 from semantic_terraform_agent.reasoning.prompts import (
@@ -129,20 +130,27 @@ class OpenRouterProvider:
 
         started = time.perf_counter()
         active_prompt = prompt
+        response_model = (
+            ModelDiagnosis if call_type is LLMCallType.DIAGNOSIS else SemanticEditSet
+        )
         try:
             payload = self._request_completion(
                 active_prompt,
                 api_key=api_key,
                 enforce_structured_output=True,
+                response_model=response_model,
+                call_type=call_type,
             )
         except ProviderError as exc:
             if exc.category is not ProviderFailureCategory.STRUCTURED_OUTPUT_UNSUPPORTED:
                 raise
-            active_prompt = _json_fallback_prompt(prompt)
+            active_prompt = _json_fallback_prompt(prompt, response_model)
             payload = self._request_completion(
                 active_prompt,
                 api_key=api_key,
                 enforce_structured_output=False,
+                response_model=response_model,
+                call_type=call_type,
             )
         latency_ms = round((time.perf_counter() - started) * 1000)
         return _provider_response(
@@ -159,6 +167,8 @@ class OpenRouterProvider:
         *,
         api_key: str,
         enforce_structured_output: bool,
+        response_model: type[ModelDiagnosis] | type[SemanticEditSet],
+        call_type: LLMCallType,
     ) -> dict[str, Any]:
         request_body: dict[str, Any] = {
             "model": self.model,
@@ -168,13 +178,19 @@ class OpenRouterProvider:
             ],
             "temperature": 0.1,
         }
+        if call_type is LLMCallType.REPAIR:
+            request_body["max_tokens"] = DEFAULT_LIMITS.max_structured_repair_output_tokens
         if enforce_structured_output:
             request_body["response_format"] = {
                 "type": "json_schema",
                 "json_schema": {
-                    "name": "terraform_diagnosis",
+                    "name": (
+                        "terraform_diagnosis"
+                        if call_type is LLMCallType.DIAGNOSIS
+                        else "terraform_candidate_edit"
+                    ),
                     "strict": True,
-                    "schema": ModelDiagnosis.model_json_schema(),
+                    "schema": response_model.model_json_schema(),
                 },
             }
             request_body["provider"] = {"require_parameters": True}
@@ -246,8 +262,11 @@ class OpenRouterProvider:
         return min(self._backoff_seconds * (2**attempt), 2.0)
 
 
-def _json_fallback_prompt(prompt: PromptParts) -> PromptParts:
-    schema = json.dumps(ModelDiagnosis.model_json_schema(), separators=(",", ":"))
+def _json_fallback_prompt(
+    prompt: PromptParts,
+    response_model: type[ModelDiagnosis] | type[SemanticEditSet],
+) -> PromptParts:
+    schema = json.dumps(response_model.model_json_schema(), separators=(",", ":"))
     return PromptParts(
         system=(
             f"{prompt.system}\n\nThe selected model cannot use API-enforced structured "
@@ -393,7 +412,12 @@ def _provider_response(
             category=ProviderFailureCategory.RESPONSE_INVALID,
         )
     try:
-        diagnosis = ModelDiagnosis.model_validate(json.loads(content))
+        decoded = json.loads(content)
+        response_value = (
+            ModelDiagnosis.model_validate(decoded)
+            if call_type is LLMCallType.DIAGNOSIS
+            else SemanticEditSet.model_validate(decoded)
+        )
     except (json.JSONDecodeError, ValidationError):
         raise ProviderError(
             "OpenRouter returned invalid structured JSON.",
@@ -435,7 +459,12 @@ def _provider_response(
         finish_reason=finish_reason,
     )
     return ProviderResponse(
-        diagnosis=diagnosis,
+        diagnosis=(
+            response_value if isinstance(response_value, ModelDiagnosis) else None
+        ),
+        candidate_edit=(
+            response_value if isinstance(response_value, SemanticEditSet) else None
+        ),
         token_usage=TokenUsage(
             input_tokens=input_tokens,
             output_tokens=output_tokens,

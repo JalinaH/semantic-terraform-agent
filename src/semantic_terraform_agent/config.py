@@ -49,6 +49,11 @@ class Limits:
     max_source_bytes: int = 512 * 1024
     max_prompt_log_chars: int = 20_000
     max_patch_bytes: int = 1024 * 1024
+    max_semantic_edits: int = 8
+    max_semantic_edit_path_chars: int = 512
+    max_semantic_edit_text_chars: int = 8_000
+    max_semantic_edit_aggregate_chars: int = 24_000
+    max_structured_repair_output_tokens: int = 2_048
     max_verification_output_chars: int = 8_000
     max_diagnostic_context_chars: int = 4_000
     max_relevant_diff_chars: int = 6_000

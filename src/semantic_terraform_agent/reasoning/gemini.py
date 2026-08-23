@@ -9,7 +9,7 @@ from typing import Any, Callable
 
 from pydantic import ValidationError
 
-from semantic_terraform_agent.config import ProviderError
+from semantic_terraform_agent.config import DEFAULT_LIMITS, ProviderError
 from semantic_terraform_agent.models import (
     DiagnosisRequest,
     LLMCallType,
@@ -19,6 +19,7 @@ from semantic_terraform_agent.models import (
     ProviderFailureCategory,
     ProviderResponse,
     RepairRequest,
+    SemanticEditSet,
     TokenUsage,
 )
 from semantic_terraform_agent.reasoning.prompts import (
@@ -65,7 +66,10 @@ class GeminiProvider:
 
     def _generate(self, prompt: PromptParts, call_type: LLMCallType) -> ProviderResponse:
         client = self._client()
-        schema = _gemini_response_schema()
+        response_model = (
+            ModelDiagnosis if call_type is LLMCallType.DIAGNOSIS else SemanticEditSet
+        )
+        schema = _gemini_response_schema(response_model)
         started = time.perf_counter()
         try:
             response = client.models.generate_content(
@@ -75,6 +79,13 @@ class GeminiProvider:
                     "response_mime_type": "application/json",
                     "response_schema": schema,
                     "temperature": 0.1,
+                    **(
+                        {
+                            "max_output_tokens": DEFAULT_LIMITS.max_structured_repair_output_tokens
+                        }
+                        if call_type is LLMCallType.REPAIR
+                        else {}
+                    ),
                 },
             )
         except Exception:  # SDK transports expose several provider-specific types.
@@ -90,7 +101,8 @@ class GeminiProvider:
                 category=ProviderFailureCategory.RESPONSE_INVALID,
             )
         try:
-            diagnosis = ModelDiagnosis.model_validate(json.loads(text))
+            decoded = json.loads(text)
+            response_value = response_model.model_validate(decoded)
         except (json.JSONDecodeError, ValidationError):
             raise ProviderError(
                 "Gemini returned invalid structured JSON",
@@ -127,15 +139,22 @@ class GeminiProvider:
             finish_reason=_finish_reason(response),
         )
         return ProviderResponse(
-            diagnosis=diagnosis,
+            diagnosis=(
+                response_value if isinstance(response_value, ModelDiagnosis) else None
+            ),
+            candidate_edit=(
+                response_value if isinstance(response_value, SemanticEditSet) else None
+            ),
             token_usage=token_usage,
             llm_call=invocation,
         )
 
 
-def _gemini_response_schema() -> dict[str, Any]:
-    """Return the strict diagnosis schema using Gemini-supported keywords."""
-    schema = ModelDiagnosis.model_json_schema()
+def _gemini_response_schema(
+    response_model: type[ModelDiagnosis] | type[SemanticEditSet] = ModelDiagnosis,
+) -> dict[str, Any]:
+    """Return a strict response schema using Gemini-supported keywords."""
+    schema = response_model.model_json_schema()
     _remove_additional_properties(schema)
     return schema
 

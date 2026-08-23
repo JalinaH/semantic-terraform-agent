@@ -5,7 +5,15 @@ from __future__ import annotations
 from enum import Enum
 from typing import Literal, TypeAlias
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    field_validator,
+    model_validator,
+)
 
 
 class StrictModel(BaseModel):
@@ -79,6 +87,13 @@ PatchFailureReasonCode: TypeAlias = Literal[
     "terraform_verification_failure",
     "environment_failure",
     "unknown_patch_failure",
+    "edit_target_not_found",
+    "edit_target_ambiguous",
+    "invalid_edit_path",
+    "empty_edit",
+    "structured_edit_invalid",
+    "overlapping_edits",
+    "duplicate_edits",
 ]
 
 
@@ -421,13 +436,61 @@ class EvidenceItem(StrictModel):
     detail: str
 
 
-class ModelDiagnosis(StrictModel):
+class DiagnosisAnalysis(StrictModel):
     root_cause: str = Field(min_length=1)
     affected_resources: list[str]
     violated_constraint: str = Field(min_length=1)
-    suggested_patch: str = Field(min_length=1)
     confidence: float = Field(ge=0.0, le=1.0)
     evidence: list[EvidenceItem]
+
+
+class SemanticEdit(StrictModel):
+    file: str = Field(min_length=1, max_length=512)
+    old_text: str = Field(min_length=1, max_length=8_000)
+    new_text: str = Field(max_length=8_000)
+
+    @field_validator("file", "old_text", "new_text")
+    @classmethod
+    def reject_unsafe_control_characters(cls, value: str) -> str:
+        if any(
+            ord(character) < 32 and character not in {"\t", "\n", "\r"}
+            for character in value
+        ) or "\x7f" in value:
+            raise ValueError("structured edits contain unsupported control characters")
+        return value
+
+    @model_validator(mode="after")
+    def reject_empty_replacement(self) -> "SemanticEdit":
+        if self.old_text == self.new_text:
+            raise ValueError("structured edit replacement must change the source")
+        return self
+
+
+class SemanticEditSet(StrictModel):
+    edits: list[SemanticEdit] = Field(min_length=1, max_length=8)
+
+    @model_validator(mode="after")
+    def enforce_aggregate_budget(self) -> "SemanticEditSet":
+        aggregate = sum(
+            len(edit.file) + len(edit.old_text) + len(edit.new_text)
+            for edit in self.edits
+        )
+        if aggregate > 24_000:
+            raise ValueError("structured edits exceed the aggregate character budget")
+        return self
+
+
+class ModelDiagnosis(DiagnosisAnalysis):
+    edits: list[SemanticEdit] = Field(default_factory=list, max_length=8)
+    suggested_patch: str | None = Field(default=None, max_length=1024 * 1024)
+
+    @model_validator(mode="after")
+    def require_candidate_representation(self) -> "ModelDiagnosis":
+        if not self.edits and not (self.suggested_patch and self.suggested_patch.strip()):
+            raise ValueError("diagnosis must contain structured edits or a legacy patch")
+        if self.edits:
+            SemanticEditSet(edits=self.edits)
+        return self
 
 
 class VerificationCommand(StrictModel):
@@ -503,6 +566,8 @@ class VerificationAttempt(StrictModel):
     failure_category: PatchFailureCategory | None = None
     failure_reason_code: PatchFailureReasonCode | None = None
     failure_description: str | None = Field(default=None, max_length=500)
+    candidate_representation: Literal["structured_edit", "legacy_diff"] | None = None
+    patch_construction_strategy: str | None = Field(default=None, max_length=80)
 
 
 class SourceProvenance(StrictModel):
@@ -563,6 +628,19 @@ class DiagnosisCandidate(StrictModel):
     evidence: list[EvidenceItem]
 
 
+PatchConstructionStrategy: TypeAlias = Literal[
+    "deterministic_structured_edit_v1",
+    "legacy_verified_diff",
+    "legacy_diff_to_structured_repair",
+]
+
+
+class PatchConstruction(StrictModel):
+    strategy: PatchConstructionStrategy
+    edit_count: int = Field(ge=0, le=8)
+    legacy_diff_repaired: bool = False
+
+
 class VerificationSignal(StrictModel):
     passed: bool
     status: FinalVerificationStatus
@@ -581,6 +659,8 @@ class Diagnosis(StrictModel):
     verification: VerificationSignal
     second_attempt_reason: SecondAttemptReason = SecondAttemptReason.NONE
     repair_reason: str | None = None
+    candidate_representation: Literal["structured_edit", "legacy_diff"] = "legacy_diff"
+    patch_construction: PatchConstruction | None = None
 
 
 class TokenUsage(StrictModel):
@@ -695,9 +775,16 @@ class RepairRequest(StrictModel):
 
 
 class ProviderResponse(StrictModel):
-    diagnosis: ModelDiagnosis
+    diagnosis: ModelDiagnosis | None = None
+    candidate_edit: SemanticEditSet | None = None
     token_usage: TokenUsage = Field(default_factory=TokenUsage)
     llm_call: LLMInvocation | None = None
+
+    @model_validator(mode="after")
+    def require_one_response_contract(self) -> "ProviderResponse":
+        if (self.diagnosis is None) == (self.candidate_edit is None):
+            raise ValueError("provider response must contain exactly one response contract")
+        return self
 
 
 CacheStatus: TypeAlias = Literal[

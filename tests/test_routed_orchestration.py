@@ -66,10 +66,15 @@ class RoutedProvider:
     def repair(self, request):
         self.events.append(f"second:{self.model}")
         return ProviderResponse(
-            diagnosis=_diagnosis(
-                SECOND_PATCH,
-                schema=request.second_attempt_reason.value == "context_escalation",
-            ),
+            candidate_edit={
+                "edits": [
+                    {
+                        "file": "infrastructure/main.tf",
+                        "old_text": 'mode = "fast"',
+                        "new_text": 'mode = "slow"',
+                    }
+                ]
+            },
             token_usage=TokenUsage(input_tokens=180, output_tokens=25, total_tokens=205),
         )
 
@@ -317,7 +322,7 @@ def test_malformed_patch_repair_stays_on_initial_free_model_and_tier(
     assert result.model_progression.model_escalated is False
     assert result.model_progression.initial_tier is ModelTier.FREE
     assert result.model_progression.final_tier is ModelTier.FREE
-    assert result.llm_calls[1].repair_reason == "malformed_patch"
+    assert result.llm_calls[1].repair_reason == "malformed_patch_to_structured_edit"
     assert result.context_progression.levels_used == ["minimal"]
 
 

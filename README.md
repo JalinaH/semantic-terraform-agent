@@ -4,7 +4,7 @@ Semantic Terraform Agent diagnoses Terraform CI failures, generates a candidate 
 and verifies that patch in an isolated temporary workspace. It supports arbitrary
 Terraform repositories and does not contain benchmark-specific resource logic.
 
-Version: `1.1.1`
+Version: `1.1.2`
 
 ## How it works
 
@@ -13,7 +13,8 @@ Terraform failure and Git diff
   → normalized diagnostic
   → deterministic minimal Terraform context
   → exact Verified Failure Memory lookup
-  → model selection and structured diagnosis on a miss
+  → model selection, immutable diagnosis, and structured semantic edits on a miss
+  → deterministic Git unified-diff construction
   → isolated patch application
   → terraform fmt/init/validate/plan
   → at most one repair or schema-context escalation
@@ -166,18 +167,52 @@ On successful warm reuse, `resolution_source` is `verified_failure_memory`, `llm
 is empty, and current-run model usage is zero. Historical avoided usage is reported only
 when authoritative prior telemetry exists.
 
+### Deterministic Patch Construction
+
+Version 1.1.2 separates semantic reasoning from candidate serialization. The model
+determines the Terraform change as bounded exact-source edits containing only `file`,
+`old_text`, and `new_text`. The agent validates those edits against existing `.tf` and
+`.tf.json` files in the configured Terraform directory, applies uniquely matched,
+non-overlapping replacements to a source snapshot, and asks Git to construct the unified
+diff. Same-file edits are validated against the original source and applied from the
+bottom upward, so offsets remain stable. Zero matches, ambiguous matches, duplicate or
+overlapping edits, unsafe paths, non-UTF-8 source, and excessive output are rejected
+deterministically; the original checkout is never changed.
+
+This removes model-authored hunk headers from the primary path, preventing malformed
+header counts and concatenated headers while reducing repair-token waste. It also keeps
+the exact patch used by verification byte-identical to `diagnosis.final_patch`, its
+SHA-256 provenance, and any Verified Failure Memory entry. `final_patch` remains a normal
+unified diff, so existing TerraFix dashboard integrations remain compatible. Additive
+`candidate_representation` and `patch_construction` metadata describe whether the run
+used `deterministic_structured_edit_v1`, `legacy_verified_diff`, or
+`legacy_diff_to_structured_repair` without duplicating source text.
+
+The first successful response is authoritative for root cause, affected resources,
+violated constraint, confidence, and evidence. Repair responses use the smaller edit-only
+schema and cannot replace those fields. A defensive orchestration assertion checks that
+the captured semantic diagnosis is unchanged before final serialization.
+
+Valid legacy unified diffs remain accepted as a compatibility path. A malformed legacy
+diff consumes at most the existing second call, which requests structured edits—not
+another unified diff—on the same model, tier, and minimal context. Formatting and edit
+targeting repairs do not trigger schema retrieval. The full isolated Git/Terraform
+verification pipeline remains authoritative; successful patch construction alone is not
+verification. AST-aware Terraform mutation may be considered in a future release but is
+not part of v1.1.2.
+
 ### Patch-failure classification and bounded repair
 
-Version 1.1.1 classifies every rejected or failed candidate deterministically as
+Version 1.1.2 classifies every rejected or failed candidate deterministically as
 `malformed_repairable`, `unsafe`, `semantic_verification_failure`,
 `environment_failure`, or `unknown`. Machine-readable reason codes distinguish cases
 such as missing headers, concatenated diff serialization, Markdown-fence leakage,
 unsafe paths, unsupported file operations, a patch that does not apply, and Terraform
 verification failures.
 
-Only a representation-level `malformed_repairable` result can use the one existing
-second model call. That call keeps the same model and tier, preserves the diagnosed
-change and affected-file scope, and asks only for a valid unified diff. It does not
+Only a representation-level `malformed_repairable` result can use the same-context
+repair form of the one existing second model call. That call keeps the same model and tier, preserves the immutable
+diagnosis and affected-file scope, and asks only for corrected structured edits. It does not
 retrieve schema merely to fix diff formatting. Unsafe candidates stop immediately;
 there is no third call or model-hopping loop. A repaired candidate must pass the entire
 isolated verification pipeline and only the repaired final patch may be hashed, cached,
@@ -214,7 +249,7 @@ The production workflow is:
 ```yaml
 jobs:
   diagnose:
-    uses: JalinaH/semantic-terraform-agent/.github/workflows/terraform-agent.yml@v1.1.1
+    uses: JalinaH/semantic-terraform-agent/.github/workflows/terraform-agent.yml@v1.1.2
     permissions:
       contents: read
       id-token: write

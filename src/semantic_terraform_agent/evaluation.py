@@ -378,7 +378,7 @@ def _result_metrics(
         ),
         "root_cause_correctness": all(term in diagnosis_text for term in terms),
         "candidate_patch_generated": bool(
-            final and final.suggested_patch.strip()
+            final and (final.suggested_patch or "").strip()
         ),
         "patch_correctness": verified,
     }

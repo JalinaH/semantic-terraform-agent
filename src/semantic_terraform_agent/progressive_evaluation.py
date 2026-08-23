@@ -252,7 +252,7 @@ def _offline_prompts(case_dir: Path):
     )
     attempt = VerificationAttempt(
         attempt=1,
-        patch=model_diagnosis.suggested_patch,
+        patch=model_diagnosis.suggested_patch or "",
         status="failed",
         failed_stage="plan",
         commands=VerificationCommands(plan=command),

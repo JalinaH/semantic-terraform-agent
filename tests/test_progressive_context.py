@@ -75,10 +75,15 @@ class ProgressiveProvider:
         self.second_request = request
         self.repair_calls += 1
         return ProviderResponse(
-            diagnosis=_diagnosis(
-                SECOND_PATCH,
-                schema=request.second_attempt_reason.value == "context_escalation",
-            ),
+            candidate_edit={
+                "edits": [
+                    {
+                        "file": "infrastructure/main.tf",
+                        "old_text": 'mode = "fast"',
+                        "new_text": 'mode = "slow"',
+                    }
+                ]
+            },
             token_usage=TokenUsage(
                 input_tokens=180,
                 output_tokens=25,

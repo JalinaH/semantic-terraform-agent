@@ -278,7 +278,7 @@ def _result_metrics(result: ResultDocument | None) -> dict[str, Any] | None:
         "repair_used": diagnosis.repair is not None if diagnosis else None,
         "latency_seconds": result.timing.get("total_seconds"),
         "diagnosis_structurally_valid": diagnosis is not None and final is not None,
-        "candidate_patch_generated": bool(final and final.suggested_patch.strip()),
+        "candidate_patch_generated": bool(final and (final.suggested_patch or "").strip()),
     }
 
 

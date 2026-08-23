@@ -138,14 +138,14 @@ class ContextEscalationPolicy:
                 return _repair(
                     level,
                     "malformed_patch",
-                    "The intended Terraform change is in scope, but its unified-diff representation is malformed.",
+                    "The intended Terraform change is in scope, but its candidate representation or deterministic edit construction is invalid.",
                     signals,
                     relation,
                 )
             return _stop(
                 level,
                 "second_attempt_disabled",
-                "The malformed patch is repairable, but the bounded second attempt is disabled.",
+                "The invalid candidate representation is repairable, but the bounded second attempt is disabled.",
                 signals,
                 relation,
             )

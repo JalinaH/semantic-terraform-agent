@@ -36,14 +36,14 @@ def test_three_case_offline_schema_comparison_has_golden_paths_and_gates(
         244,
     ]
     assert [row["v0_6_prompt_characters"] for row in rows] == [
-        10_871,
-        4_858,
-        14_033,
+        10_995,
+        4_982,
+        14_157,
     ]
     assert [row["v0_7_prompt_characters"] for row in rows] == [
-        2_935,
-        2_902,
-        2_508,
+        3_059,
+        3_026,
+        2_632,
     ]
     assert all(row["input_token_reduction_ratio"] is None for row in rows)
     assert all(row["v0_6_cost_usd"] is None for row in rows)

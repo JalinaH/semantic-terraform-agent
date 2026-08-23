@@ -122,19 +122,24 @@ def test_extra_gemini_fields_are_rejected() -> None:
 
 
 def test_gemini_repair_uses_dedicated_prompt_and_same_strict_schema() -> None:
-    models = FakeModels(json.dumps(valid_payload()))
+    models = FakeModels(
+        json.dumps(
+            {"edits": [{"file": "main.tf", "old_text": "old", "new_text": "new"}]}
+        )
+    )
     provider = GeminiProvider(
         "gemini-test",
         api_key="x",
         client_factory=lambda **_: SimpleNamespace(models=models),
     )
     response = provider.repair(repair_request())
-    assert response.diagnosis.root_cause == "mode is invalid"
+    assert response.diagnosis is None
+    assert response.candidate_edit is not None
+    assert response.candidate_edit.edits[0].new_text == "new"
     assert response.llm_call is not None
     assert response.llm_call.call_type.value == "repair"
-    assert "previous candidate patch did not pass Terraform verification" in models.last_kwargs[
-        "contents"
-    ]
+    assert "Return only\ncorrected structured" in models.last_kwargs["contents"]
+    assert models.last_kwargs["config"]["max_output_tokens"] == 2048
 
 
 def test_missing_api_key_is_reported(monkeypatch) -> None:

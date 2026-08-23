@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Protocol
 
@@ -71,12 +72,15 @@ from semantic_terraform_agent.models import (
     ModelRoutingMode,
     ModelTier,
     PatchFailureCategory,
+    PatchConstruction,
+    PatchFailureReasonCode,
     RepairRequest,
     RepositoryInfo,
     ResultDocument,
     SchemaOptimization,
     SchemaSlice,
     SecondAttemptReason,
+    SemanticEditSet,
     TerraformInfo,
     TokenUsage,
     VerificationAttempt,
@@ -110,6 +114,11 @@ from semantic_terraform_agent.terraform.provenance import (
     build_verified_patch_contract,
     collect_source_provenance,
 )
+from semantic_terraform_agent.terraform.patch_builder import (
+    BuiltPatch,
+    StructuredEditFailure,
+    build_patch_from_edits,
+)
 from semantic_terraform_agent.terraform.verification import (
     skipped_verification,
     verify_candidate_patch,
@@ -129,13 +138,15 @@ def _elapsed(start: float) -> float:
     return round(time.perf_counter() - start, 6)
 
 
-def calculate_evidence_score(request: DiagnosisRequest, diagnosis) -> float:
+def calculate_evidence_score(
+    request: DiagnosisRequest, diagnosis, candidate_patch: str
+) -> float:
     evidence_sources = {item.source for item in diagnosis.evidence}
     checks = [
         bool(diagnosis.affected_resources and request.resources),
         bool(request.failure.summary and "terraform_error" in evidence_sources),
         bool(request.git_diff.strip() and "git_diff" in evidence_sources),
-        bool(diagnosis.suggested_patch.strip()),
+        bool(candidate_patch.strip() or diagnosis.edits),
     ]
     if request.schema_slices:
         checks.append(
@@ -151,14 +162,111 @@ def calculate_evidence_score(request: DiagnosisRequest, diagnosis) -> float:
     return round(sum(checks) / len(checks), 2)
 
 
-def _candidate(diagnosis) -> DiagnosisCandidate:
+def _candidate(diagnosis, patch: str) -> DiagnosisCandidate:
     return DiagnosisCandidate(
         root_cause=diagnosis.root_cause,
         affected_resources=diagnosis.affected_resources,
         violated_constraint=diagnosis.violated_constraint,
-        suggested_patch=diagnosis.suggested_patch,
+        suggested_patch=patch,
         model_confidence=diagnosis.confidence,
         evidence=diagnosis.evidence,
+    )
+
+
+def _repair_candidate(
+    original: DiagnosisCandidate, patch: str
+) -> DiagnosisCandidate:
+    """Carry immutable semantic analysis forward with only a new patch artifact."""
+    return original.model_copy(update={"suggested_patch": patch})
+
+
+@dataclass(frozen=True)
+class _CandidatePatch:
+    patch: str
+    representation: Literal["structured_edit", "legacy_diff"]
+    construction: PatchConstruction
+    failure: StructuredEditFailure | None = None
+
+
+def _construct_candidate(model, layout: RepositoryLayout) -> _CandidatePatch:
+    if model.edits:
+        try:
+            built = build_patch_from_edits(SemanticEditSet(edits=model.edits), layout)
+        except StructuredEditFailure as exc:
+            return _CandidatePatch(
+                patch="",
+                representation="structured_edit",
+                construction=PatchConstruction(
+                    strategy="deterministic_structured_edit_v1",
+                    edit_count=len(model.edits),
+                ),
+                failure=exc,
+            )
+        return _built_candidate(built)
+    return _CandidatePatch(
+        patch=model.suggested_patch or "",
+        representation="legacy_diff",
+        construction=PatchConstruction(
+            strategy="legacy_verified_diff",
+            edit_count=0,
+        ),
+    )
+
+
+def _built_candidate(
+    built: BuiltPatch, *, legacy_diff_repaired: bool = False
+) -> _CandidatePatch:
+    return _CandidatePatch(
+        patch=built.patch,
+        representation="structured_edit",
+        construction=PatchConstruction(
+            strategy=(
+                "legacy_diff_to_structured_repair"
+                if legacy_diff_repaired
+                else "deterministic_structured_edit_v1"
+            ),
+            edit_count=built.edit_count,
+            legacy_diff_repaired=legacy_diff_repaired,
+        ),
+    )
+
+
+def _construction_attempt(
+    candidate: _CandidatePatch, *, attempt: int
+) -> VerificationAttempt:
+    assert candidate.failure is not None
+    reason_code = TypeAdapter(PatchFailureReasonCode).validate_python(
+        candidate.failure.code
+    )
+    return VerificationAttempt(
+        attempt=attempt,
+        patch=candidate.patch,
+        status="rejected",
+        failed_stage="patch_check",
+        commands=VerificationCommands(),
+        temporary_copy_cleaned=True,
+        warnings=[candidate.failure.description],
+        failure_category=(
+            PatchFailureCategory.MALFORMED_REPAIRABLE
+            if candidate.failure.repairable
+            else PatchFailureCategory.UNSAFE
+        ),
+        failure_reason_code=reason_code,
+        failure_description=candidate.failure.description,
+        candidate_representation=candidate.representation,
+        patch_construction_strategy=candidate.construction.strategy,
+    )
+
+
+def _response_edit_set(response) -> SemanticEditSet:
+    if response.candidate_edit is not None:
+        return response.candidate_edit
+    if response.diagnosis is not None and response.diagnosis.edits:
+        return SemanticEditSet(edits=response.diagnosis.edits)
+    raise StructuredEditFailure(
+        "structured_edit_invalid",
+        "the second model response did not contain corrected structured edits",
+        False,
     )
 
 
@@ -296,7 +404,7 @@ def diagnose_repository(
     cache_store: LocalCacheStore | None = None,
 ) -> ResultDocument:
     if max_repair_attempts not in (0, 1):
-        raise InputError("max_repair_attempts must be 0 or 1 in version 1.1.1")
+        raise InputError("max_repair_attempts must be 0 or 1 in version 1.1.2")
     selected_provider = parse_provider_name(provider_name)
     total_start = time.perf_counter()
     timing: dict[str, float] = {
@@ -470,7 +578,11 @@ def diagnose_repository(
                         memory_entry.candidate_patch, 1, exc
                     )
                 reuse_attempt = reuse_attempt.model_copy(
-                    update={"candidate_source": "verified_failure_memory"}
+                    update={
+                        "candidate_source": "verified_failure_memory",
+                        "candidate_representation": "legacy_diff",
+                        "patch_construction_strategy": "legacy_verified_diff",
+                    }
                 )
                 timing["initial_verification_seconds"] = _elapsed(
                     verification_started
@@ -505,6 +617,11 @@ def diagnose_repository(
                         evidence_score=memory_entry.evidence_score,
                         verification=_verification_signal(
                             "verified_first_attempt", reuse_attempt
+                        ),
+                        candidate_representation="legacy_diff",
+                        patch_construction=PatchConstruction(
+                            strategy="legacy_verified_diff",
+                            edit_count=0,
                         ),
                     )
                     timing["total_seconds"] = _elapsed(total_start)
@@ -842,20 +959,51 @@ def diagnose_repository(
     llm_calls.append(diagnosis_invocation)
     prompt_records.append((diagnosis_invocation, diagnosis_prompt, initial_request))
     initial_model = provider_response.diagnosis
-    final_model = initial_model
-    second_model = None
+    if initial_model is None:
+        raise InputError("the diagnosis call returned no semantic diagnosis")
+    initial_candidate_patch = _construct_candidate(initial_model, layout)
+    original_analysis = (
+        initial_model.root_cause,
+        tuple(initial_model.affected_resources),
+        initial_model.violated_constraint,
+        initial_model.confidence,
+        tuple((item.source, item.detail) for item in initial_model.evidence),
+    )
+    second_candidate_patch: _CandidatePatch | None = None
+    second_response_received = False
 
     started = time.perf_counter()
-    if verification_enabled:
+    if initial_candidate_patch.failure is not None:
+        first_attempt = _construction_attempt(initial_candidate_patch, attempt=1)
+    elif verification_enabled:
         try:
-            first_attempt = verifier(initial_model.suggested_patch, layout, attempt=1)
+            first_attempt = verifier(
+                initial_candidate_patch.patch, layout, attempt=1
+            ).model_copy(
+                update={
+                    "candidate_representation": initial_candidate_patch.representation,
+                    "patch_construction_strategy": initial_candidate_patch.construction.strategy,
+                }
+            )
         except Exception as exc:
-            first_attempt = _unavailable_attempt(initial_model.suggested_patch, 1, exc)
+            first_attempt = _unavailable_attempt(
+                initial_candidate_patch.patch, 1, exc
+            ).model_copy(
+                update={
+                    "candidate_representation": initial_candidate_patch.representation,
+                    "patch_construction_strategy": initial_candidate_patch.construction.strategy,
+                }
+            )
     else:
         first_attempt = skipped_verification(
             "Patch verification was disabled by the caller.",
-            initial_model.suggested_patch,
+            initial_candidate_patch.patch,
             attempt=1,
+        ).model_copy(
+            update={
+                "candidate_representation": initial_candidate_patch.representation,
+                "patch_construction_strategy": initial_candidate_patch.construction.strategy,
+            }
         )
     timing["initial_verification_seconds"] = _elapsed(started)
     timing["verification_seconds"] = timing["initial_verification_seconds"]
@@ -911,12 +1059,15 @@ def diagnose_repository(
             )
     elif decision.action == "repair":
         second_attempt_reason = SecondAttemptReason.REPAIR
-        repair_reason = (
-            "malformed_patch"
-            if first_attempt.failure_category
-            is PatchFailureCategory.MALFORMED_REPAIRABLE
-            else decision.reason_code
-        )
+        if (
+            first_attempt.failure_category is PatchFailureCategory.MALFORMED_REPAIRABLE
+            and initial_candidate_patch.representation == "legacy_diff"
+        ):
+            repair_reason = "malformed_patch_to_structured_edit"
+        elif first_attempt.failure_category is PatchFailureCategory.MALFORMED_REPAIRABLE:
+            repair_reason = "structured_edit_repair"
+        else:
+            repair_reason = decision.reason_code
 
     repair_error: str | None = None
     if second_attempt_reason is not SecondAttemptReason.NONE:
@@ -966,15 +1117,48 @@ def diagnose_repository(
         try:
             semantic_call_attempts += 1
             repair_response = second_provider.repair(repair_request)
-            second_model = repair_response.diagnosis
-            final_model = second_model
+            second_response_received = True
+            try:
+                repair_edits = _response_edit_set(repair_response)
+                built = build_patch_from_edits(repair_edits, layout)
+                second_candidate_patch = _built_candidate(
+                    built,
+                    legacy_diff_repaired=(
+                        initial_candidate_patch.representation == "legacy_diff"
+                    ),
+                )
+            except StructuredEditFailure as exc:
+                second_candidate_patch = _CandidatePatch(
+                    patch="",
+                    representation="structured_edit",
+                    construction=PatchConstruction(
+                        strategy=(
+                            "legacy_diff_to_structured_repair"
+                            if initial_candidate_patch.representation == "legacy_diff"
+                            else "deterministic_structured_edit_v1"
+                        ),
+                        edit_count=(
+                            len(repair_response.candidate_edit.edits)
+                            if repair_response.candidate_edit is not None
+                            else (
+                                len(repair_response.diagnosis.edits)
+                                if repair_response.diagnosis is not None
+                                else 0
+                            )
+                        ),
+                        legacy_diff_repaired=(
+                            initial_candidate_patch.representation == "legacy_diff"
+                        ),
+                    ),
+                    failure=exc,
+                )
         except Exception as exc:
             repair_error = f"Second model call failed: {exc}"
             warnings.append(repair_error)
         timing["second_llm_seconds"] = _elapsed(started)
         timing["repair_llm_seconds"] = timing["second_llm_seconds"]
 
-        if second_model is not None:
+        if second_response_received:
             repair_invocation = invocation_from_response(
                 repair_response,
                 provider=selected_provider,
@@ -989,14 +1173,30 @@ def diagnose_repository(
             llm_calls.append(repair_invocation)
             prompt_records.append((repair_invocation, repair_prompt, active_request))
             started = time.perf_counter()
-            try:
-                second_attempt = verifier(
-                    second_model.suggested_patch, layout, attempt=2
+            assert second_candidate_patch is not None
+            if second_candidate_patch.failure is not None:
+                second_attempt = _construction_attempt(
+                    second_candidate_patch, attempt=2
                 )
-            except Exception as exc:
-                second_attempt = _unavailable_attempt(
-                    second_model.suggested_patch, 2, exc
-                )
+            else:
+                try:
+                    second_attempt = verifier(
+                        second_candidate_patch.patch, layout, attempt=2
+                    ).model_copy(
+                        update={
+                            "candidate_representation": "structured_edit",
+                            "patch_construction_strategy": second_candidate_patch.construction.strategy,
+                        }
+                    )
+                except Exception as exc:
+                    second_attempt = _unavailable_attempt(
+                        second_candidate_patch.patch, 2, exc
+                    ).model_copy(
+                        update={
+                            "candidate_representation": "structured_edit",
+                            "patch_construction_strategy": second_candidate_patch.construction.strategy,
+                        }
+                    )
             timing["second_verification_seconds"] = _elapsed(started)
             timing["verification_seconds"] = round(
                 timing["initial_verification_seconds"]
@@ -1030,20 +1230,48 @@ def diagnose_repository(
 
     verification_status = _final_status(attempts)
     final_attempt = attempts[-1]
-    evidence_request = active_request if second_model is not None else initial_request
+    final_candidate_patch = second_candidate_patch or initial_candidate_patch
+    initial_candidate = _candidate(initial_model, initial_candidate_patch.patch)
+    repair_candidate = (
+        _repair_candidate(initial_candidate, second_candidate_patch.patch)
+        if second_candidate_patch is not None
+        else None
+    )
+    final_analysis = (
+        initial_candidate.root_cause,
+        tuple(initial_candidate.affected_resources),
+        initial_candidate.violated_constraint,
+        initial_candidate.model_confidence,
+        tuple((item.source, item.detail) for item in initial_candidate.evidence),
+    )
+    assert final_analysis == original_analysis, (
+        "semantic diagnosis fields changed after the authoritative first response"
+    )
+    if repair_candidate is not None:
+        assert (
+            repair_candidate.root_cause,
+            tuple(repair_candidate.affected_resources),
+            repair_candidate.violated_constraint,
+            repair_candidate.model_confidence,
+            tuple((item.source, item.detail) for item in repair_candidate.evidence),
+        ) == original_analysis, "candidate repair overwrote immutable diagnosis fields"
     diagnosis = Diagnosis(
-        initial=_candidate(initial_model),
-        repair=_candidate(second_model) if second_model is not None else None,
+        initial=initial_candidate,
+        repair=repair_candidate,
         attempts=attempts,
         final_patch=final_attempt.patch,
         verification_status=verification_status,
-        model_confidence=final_model.confidence,
-        evidence_score=calculate_evidence_score(evidence_request, final_model),
+        model_confidence=initial_model.confidence,
+        evidence_score=calculate_evidence_score(
+            initial_request, initial_model, initial_candidate_patch.patch
+        ),
         verification=_verification_signal(
             verification_status, final_attempt, reason=repair_error
         ),
         second_attempt_reason=second_attempt_reason,
         repair_reason=repair_reason,
+        candidate_representation=final_candidate_patch.representation,
+        patch_construction=final_candidate_patch.construction,
     )
 
     llm_usage = aggregate_usage(llm_calls)

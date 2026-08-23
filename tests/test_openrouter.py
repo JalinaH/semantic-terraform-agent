@@ -80,6 +80,14 @@ def success_payload(*, cost: float | None = 0.0) -> dict[str, Any]:
     }
 
 
+def repair_payload() -> dict[str, Any]:
+    payload = success_payload(cost=0.001)
+    payload["choices"][0]["message"]["content"] = json.dumps(
+        {"edits": [{"file": "main.tf", "old_text": "old", "new_text": "new"}]}
+    )
+    return payload
+
+
 class FakeTransport:
     def __init__(self, *responses: HTTPResponse | Exception) -> None:
         self.responses = list(responses)
@@ -187,13 +195,23 @@ def test_openrouter_request_and_usage_telemetry() -> None:
 
 
 def test_openrouter_repair_is_tagged_separately() -> None:
-    transport = FakeTransport(response(success_payload(cost=0.001)))
+    transport = FakeTransport(response(repair_payload()))
     result = provider(transport).repair(repair_request())
+    assert result.diagnosis is None
+    assert result.candidate_edit is not None
+    assert result.candidate_edit.edits[0].file == "main.tf"
     assert result.llm_call is not None
     assert result.llm_call.call_type is LLMCallType.REPAIR
-    assert "previous candidate patch did not pass" in transport.calls[0]["body"]["messages"][0][
-        "content"
-    ]
+    body = transport.calls[0]["body"]
+    assert body["max_tokens"] == 2048
+    assert body["response_format"]["json_schema"]["name"] == "terraform_candidate_edit"
+    assert "Return only\ncorrected structured" in body["messages"][0]["content"]
+
+
+def test_openrouter_repair_rejects_diagnosis_fields() -> None:
+    transport = FakeTransport(response(success_payload()))
+    with pytest.raises(ProviderError, match="invalid structured JSON"):
+        provider(transport).repair(repair_request())
 
 
 def test_structured_output_unsupported_falls_back_to_strict_json_prompt() -> None:

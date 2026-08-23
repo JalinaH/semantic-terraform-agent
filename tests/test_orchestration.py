@@ -70,8 +70,16 @@ class FakeProvider:
         if isinstance(self.repair_result, Exception):
             raise self.repair_result
         assert self.repair_result is not None
+        if self.repair_result.suggested_patch and ".env" in self.repair_result.suggested_patch:
+            edit = {"file": ".env", "old_text": "a", "new_text": "b"}
+        else:
+            edit = {
+                "file": "infrastructure/main.tf",
+                "old_text": 'mode = "fast"',
+                "new_text": 'mode = "slow"',
+            }
         return ProviderResponse(
-            diagnosis=self.repair_result,
+            candidate_edit={"edits": [edit]},
             token_usage=TokenUsage(total_tokens=20),
         )
 
@@ -354,11 +362,12 @@ def test_successful_second_attempt_preserves_history_and_confidence(
     result = run_diagnosis(terraform_repo, failure_log, diff_file, provider, verifier)
     assert result.diagnosis.verification_status == "verified_after_retry"
     assert result.diagnosis.verification.passed is True
-    assert result.diagnosis.model_confidence == 0.72
+    assert result.diagnosis.model_confidence == 0.9
     assert result.diagnosis.model_confidence != 1.0
-    assert result.diagnosis.final_patch == REPAIR_PATCH
+    assert 'mode = "slow"' in result.diagnosis.final_patch
     assert [item.attempt for item in result.diagnosis.attempts] == [1, 2]
-    assert [item.patch for item in result.diagnosis.attempts] == [INITIAL_PATCH, REPAIR_PATCH]
+    assert result.diagnosis.attempts[0].patch == INITIAL_PATCH
+    assert result.diagnosis.attempts[1].patch == result.diagnosis.final_patch
     assert provider.diagnose_calls + provider.repair_calls == 2
     assert verifier_calls == 2
     assert result.token_usage.total_tokens == 30
@@ -493,7 +502,8 @@ def test_second_patch_is_independently_rejected(
     assert result.diagnosis.verification_status == "patch_rejected"
     assert result.diagnosis.attempts[0].status == "failed"
     assert result.diagnosis.attempts[1].status == "rejected"
-    assert result.diagnosis.final_patch == unsafe.suggested_patch
+    assert result.diagnosis.final_patch == ""
+    assert result.diagnosis.attempts[1].failure_reason_code == "invalid_edit_path"
 
 
 def test_verification_can_be_intentionally_skipped(
