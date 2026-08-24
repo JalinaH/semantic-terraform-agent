@@ -39,6 +39,9 @@ _DATA_START = re.compile(
     r'"(?P<name>[A-Za-z0-9_-]+)"\s*\{'
 )
 _LOCALS_START = re.compile(r"(?m)^\s*locals\s*\{")
+_DIAGNOSTIC_BLOCK_START = re.compile(
+    r'(?m)^(?:check|module|output|variable|locals|terraform|provider|data)\b[^\n{]*\{'
+)
 _VAR_REF = re.compile(r"\bvar\.([A-Za-z_][A-Za-z0-9_-]*)")
 _LOCAL_REF = re.compile(r"\blocal\.([A-Za-z_][A-Za-z0-9_-]*)")
 _MODULE_REF = re.compile(
@@ -469,6 +472,71 @@ def minimal_sources(context: DiagnosisContext) -> dict[str, str]:
             if block.source
         )
     return result
+
+
+def diagnostic_location_sources(
+    all_sources: dict[str, str],
+    source_file: str | None,
+    source_line: int | None,
+    *,
+    maximum: int = DEFAULT_LIMITS.max_resource_block_chars,
+) -> dict[str, str]:
+    """Select one bounded Terraform block or line-focused excerpt by diagnostic location."""
+    if not source_file or source_line is None or source_line < 1:
+        return {}
+    matches = [path for path in all_sources if _same_file(path, source_file)]
+    if len(matches) != 1:
+        return {}
+    path = matches[0]
+    source = all_sources[path]
+    line_count = len(source.splitlines())
+    if source_line > line_count:
+        return {}
+
+    containing = [
+        block
+        for block in extract_resource_blocks({path: source})
+        if block.start_line <= source_line <= block.end_line
+    ]
+    if containing:
+        block = min(
+            containing,
+            key=lambda item: (item.end_line - item.start_line, item.start_line),
+        )
+        excerpt, _, _, _ = _bounded_hcl_excerpt(
+            block.source,
+            block.start_line,
+            block.end_line,
+            (source_line,),
+            maximum,
+        )
+    else:
+        blocks: list[tuple[int, int, str]] = []
+        for match in _DIAGNOSTIC_BLOCK_START.finditer(source):
+            opening = source.find("{", match.start())
+            closing = _matching_brace(source, opening)
+            start = source.count("\n", 0, match.start()) + 1
+            end = source.count("\n", 0, closing) + 1
+            if start <= source_line <= end:
+                blocks.append((start, end, source[match.start() : closing + 1]))
+        if blocks:
+            start, end, block_source = min(
+                blocks, key=lambda item: (item[1] - item[0], item[0])
+            )
+            excerpt, _, _, _ = _bounded_hcl_excerpt(
+                block_source,
+                start,
+                end,
+                (source_line,),
+                maximum,
+            )
+        else:
+            lines = source.splitlines(keepends=True)
+            center = source_line - 1
+            low = max(center - DEFAULT_LIMITS.diff_context_lines, 0)
+            high = min(center + DEFAULT_LIMITS.diff_context_lines + 1, len(lines))
+            excerpt = "".join(lines[low:high])[:maximum]
+    return {path: excerpt} if excerpt else {}
 
 
 def minimal_diff(context: DiagnosisContext) -> str:

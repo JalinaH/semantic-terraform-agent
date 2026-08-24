@@ -174,6 +174,7 @@ def _run(
     cache_store: LocalCacheStore | None = None,
     failure_memory_enabled: bool = False,
     max_repair_attempts: int = 1,
+    context_mode: str = "lightweight",
 ):
     return diagnose_repository(
         repo_path=terraform_repo,
@@ -182,7 +183,7 @@ def _run(
         diff_file=diff_file,
         provider_name="openrouter",
         model="test/model:free",
-        context_mode="lightweight",
+        context_mode=context_mode,
         llm_provider=provider,
         patch_verifier=verifier,
         max_repair_attempts=max_repair_attempts,
@@ -310,27 +311,69 @@ def test_semantic_plan_failure_is_ineligible_and_can_use_one_repair(
 
 
 def test_resource_precondition_plan_failure_uses_second_semantic_call(
-    terraform_repo: Path, failure_log: Path, diff_file: Path
+    terraform_repo: Path, failure_log: Path, diff_file: Path, monkeypatch
 ) -> None:
-    (terraform_repo / "infrastructure/main.tf").write_text(
+    (terraform_repo / "infrastructure/variables.tf").write_text(
         '''variable "environment" {
   type = number
 }
 
-resource "example_widget" "primary" {
-  mode = "fast"
+resource "example_widget" "config" {
+  mode = "safe"
+}
+''',
+        encoding="utf-8",
+    )
+    (terraform_repo / "infrastructure/main.tf").write_text(
+        '''resource "terraform" "ui" {
+  minimum_replicas = 5
+  maximum_replicas = 3
 
   lifecycle {
     precondition {
-      condition     = self.mode == "slow"
-      error_message = "mode must be slow"
+      # Keep the scaling bounds internally consistent.
+
+      # Terraform reports the condition location below.
+
+      condition     = self.minimum_replicas <= self.maximum_replicas
+      error_message = "Minimum replicas cannot be greater than maximum replicas."
     }
   }
 }
 ''',
         encoding="utf-8",
     )
+    failure_log.write_text(
+        '''Terraform plan failed.
+Error: Invalid value for input variable
+with example_widget.config,
+on variables.tf line 2:
+environment must be a string.
+''',
+        encoding="utf-8",
+    )
+    diff_file.write_text(
+        '''--- a/infrastructure/variables.tf
++++ b/infrastructure/variables.tf
+@@ -1,3 +1,3 @@
+ variable "environment" {
+-  type = string
++  type = number
+ }
+''',
+        encoding="utf-8",
+    )
     commit = _commit(terraform_repo)
+
+    def forbidden_schema(*args, **kwargs):
+        raise AssertionError(
+            "Terraform precondition repair must not require provider schema"
+        )
+
+    monkeypatch.setattr(
+        "semantic_terraform_agent.orchestration.diagnose.inspect_schemas",
+        forbidden_schema,
+    )
 
     class PreconditionProvider:
         def __init__(self) -> None:
@@ -347,7 +390,7 @@ resource "example_widget" "primary" {
                     violated_constraint="environment must accept a string",
                     edits=[
                         {
-                            "file": "infrastructure/main.tf",
+                            "file": "infrastructure/variables.tf",
                             "old_text": "  type = number",
                             "new_text": "  type = string",
                         }
@@ -370,14 +413,14 @@ resource "example_widget" "primary" {
                 candidate_edit={
                     "edits": [
                         {
-                            "file": "infrastructure/main.tf",
+                            "file": "infrastructure/variables.tf",
                             "old_text": "  type = number",
                             "new_text": "  type = string",
                         },
                         {
                             "file": "infrastructure/main.tf",
-                            "old_text": '  mode = "fast"',
-                            "new_text": '  mode = "slow"',
+                            "old_text": "  maximum_replicas = 3",
+                            "new_text": "  maximum_replicas = 10",
                         },
                     ]
                 },
@@ -393,12 +436,14 @@ resource "example_widget" "primary" {
             "diagnostic": {
                 "severity": "error",
                 "summary": "Resource precondition failed",
-                "detail": "mode must be slow",
+                "detail": (
+                    "Minimum replicas cannot be greater than maximum replicas."
+                ),
                 "range": {
-                    "filename": "infrastructure/main.tf",
-                    "start": {"line": 10, "column": 7, "byte": 150},
+                    "filename": "main.tf",
+                    "start": {"line": 11, "column": 7, "byte": 220},
                 },
-                "address": "example_widget.primary",
+                "address": "terraform.ui",
             },
         }
     )
@@ -406,9 +451,9 @@ resource "example_widget" "primary" {
     def verifier(patch, layout, *, attempt):
         assert '+  type = string' in patch
         if attempt == 1:
-            assert '+  mode = "slow"' not in patch
+            assert "+  maximum_replicas = 10" not in patch
             return _failed_plan_attempt(patch, attempt, diagnostic)
-        assert '+  mode = "slow"' in patch
+        assert "+  maximum_replicas = 10" in patch
         return _verified_attempt(patch, attempt)
 
     result = _run(
@@ -418,6 +463,7 @@ resource "example_widget" "primary" {
         provider,
         verifier,
         source_revision=commit,
+        context_mode="auto",
     )
 
     first_failure = result.diagnosis.attempts[0].plan_failure
@@ -429,14 +475,29 @@ resource "example_widget" "primary" {
     assert result.llm_usage.call_count == 2
     assert len(result.diagnosis.attempts) == 2
     assert '+  type = string' in result.diagnosis.final_patch
-    assert '+  mode = "slow"' in result.diagnosis.final_patch
+    assert "+  maximum_replicas = 10" in result.diagnosis.final_patch
+    assert result.context_progression.reason_code == (
+        "terraform_language_semantic_failure"
+    )
+    assert result.context_progression.schema_retrieval_attempted is False
+    assert result.diagnosis.initial.root_cause == (
+        "The environment variable has the wrong Terraform type."
+    )
+    assert result.diagnosis.repair.root_cause == result.diagnosis.initial.root_cause
 
     repair_prompt = build_repair_prompt_parts(provider.repair_request).user
     assert '"summary":"Resource precondition failed"' in repair_prompt
-    assert '"detail":"mode must be slow"' in repair_prompt
-    assert '"source_file":"infrastructure/main.tf"' in repair_prompt
-    assert '"source_line":10' in repair_prompt
-    assert '"resource_address":"example_widget.primary"' in repair_prompt
+    assert (
+        '"detail":"Minimum replicas cannot be greater than maximum replicas."'
+        in repair_prompt
+    )
+    assert '"source_file":"main.tf"' in repair_prompt
+    assert '"source_line":11' in repair_prompt
+    assert '"resource_address":"terraform.ui"' in repair_prompt
+    assert "TERRAFORM SOURCE AT PLAN DIAGNOSTIC LOCATION" in repair_prompt
+    assert "File: infrastructure/main.tf" in repair_prompt
+    assert "minimum_replicas = 5" in repair_prompt
+    assert "maximum_replicas = 3" in repair_prompt
     assert "precondition {" in repair_prompt
 
 

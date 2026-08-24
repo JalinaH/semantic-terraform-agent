@@ -114,7 +114,7 @@ jobs:
       contents: read
       id-token: write
       pull-requests: write
-    uses: JalinaH/semantic-terraform-agent/.github/workflows/terraform-agent.yml@v1.1.5
+    uses: JalinaH/semantic-terraform-agent/.github/workflows/terraform-agent.yml@v1.1.6
     with:
       terraform_dir: infrastructure
       terraform_version: "1.15.7"

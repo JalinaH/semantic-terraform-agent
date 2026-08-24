@@ -27,6 +27,7 @@ _SECTION_NAMES = (
     "original_diagnosis",
     "original_patch",
     "verification_evidence",
+    "diagnostic_source",
     "patch_failure",
     "escalation_evidence",
 )
@@ -146,6 +147,7 @@ def build_repair_prompt_parts(request: RepairRequest) -> PromptParts:
             )
         ),
         "verification_evidence": _render_verification_evidence(request),
+        "diagnostic_source": _render_diagnostic_source(request),
         "patch_failure": _render_patch_failure(request),
         "escalation_evidence": _render_escalation_evidence(request),
         "metadata": _render_metadata(request.original),
@@ -193,6 +195,25 @@ def _render_patch_failure(request: RepairRequest) -> str:
     }
     return "PATCH PARSER FAILURE\n" + json.dumps(
         payload, separators=(",", ":"), sort_keys=True
+    )
+
+
+def _render_diagnostic_source(request: RepairRequest) -> str:
+    failure = request.failed_attempt.plan_failure
+    if failure is None or failure.source_file is None or failure.source_line is None:
+        return ""
+    normalized = failure.source_file.replace("\\", "/")
+    matches = [
+        (path, source)
+        for path, source in request.original.relevant_sources.items()
+        if path == normalized or path.endswith(f"/{normalized}")
+    ]
+    if len(matches) != 1:
+        return ""
+    path, source = matches[0]
+    return (
+        "TERRAFORM SOURCE AT PLAN DIAGNOSTIC LOCATION\n"
+        f"File: {path}\nReported line: {failure.source_line}\n{source}"
     )
 
 

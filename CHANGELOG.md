@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.6
+
+- Route Terraform precondition, postcondition, module-output precondition, and
+  check-block assertion failures directly to source-backed semantic repair.
+- Select bounded Terraform source by plan diagnostic file and line, and fall back
+  to it when provider-schema escalation produces no usable schema.
+
 ## 1.1.5
 
 - Classify Terraform resource precondition, postcondition, module-output

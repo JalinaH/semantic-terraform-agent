@@ -209,7 +209,7 @@ jobs:
               fi
               ;;
             *)
-              echo "::error::Unsupported provider in version 1.1.5: ${PROVIDER}"
+              echo "::error::Unsupported provider in version 1.1.6: ${PROVIDER}"
               exit 1
               ;;
           esac

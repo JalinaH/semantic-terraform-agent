@@ -47,6 +47,7 @@ from semantic_terraform_agent.context import (
     slice_schema_records,
 )
 from semantic_terraform_agent.context.builder import (
+    diagnostic_location_sources,
     minimal_diff,
     minimal_sources,
     normalize_resource_address,
@@ -405,7 +406,7 @@ def diagnose_repository(
     cache_store: LocalCacheStore | None = None,
 ) -> ResultDocument:
     if max_repair_attempts not in (0, 1):
-        raise InputError("max_repair_attempts must be 0 or 1 in version 1.1.5")
+        raise InputError("max_repair_attempts must be 0 or 1 in version 1.1.6")
     selected_provider = parse_provider_name(provider_name)
     total_start = time.perf_counter()
     timing: dict[str, float] = {
@@ -1041,6 +1042,23 @@ def diagnose_repository(
     timing["verification_seconds"] = timing["initial_verification_seconds"]
     attempts = [first_attempt]
 
+    plan_source_context: dict[str, str] = {}
+    if first_attempt.plan_failure is not None:
+        plan_source_context = diagnostic_location_sources(
+            all_sources,
+            first_attempt.plan_failure.source_file,
+            first_attempt.plan_failure.source_line,
+        )
+        if plan_source_context:
+            active_request = active_request.model_copy(
+                update={
+                    "relevant_sources": {
+                        **active_request.relevant_sources,
+                        **plan_source_context,
+                    }
+                }
+            )
+
     decision_started = time.perf_counter()
     decision = ContextEscalationPolicy().decide(
         requested_mode=context_mode,
@@ -1066,7 +1084,7 @@ def diagnose_repository(
         retrieve_schema()
         if schema_retrieved:
             second_attempt_reason = SecondAttemptReason.CONTEXT_ESCALATION
-            active_request = initial_request.model_copy(
+            active_request = active_request.model_copy(
                 update={
                     "schemas": terraform_info.schemas,
                     "terraform_version": terraform_info.version,
@@ -1076,19 +1094,50 @@ def diagnose_repository(
                 }
             )
         else:
-            decision = EscalationDecision(
-                action="stop",
-                should_escalate=False,
-                should_repair=False,
-                from_level=ContextLevel.MINIMAL,
-                reason_code="schema_unavailable",
-                reason=(
-                    "Schema escalation was indicated, but no usable provider resource "
-                    "schema could be retrieved."
-                ),
-                signals=[*decision.signals, "schema retrieval returned no usable slice"][:8],
-                verification_error_relation=decision.verification_error_relation,
-            )
+            if (
+                plan_source_context
+                and decision.verification_error_relation
+                in {
+                    VerificationErrorRelation.SAME_FAILURE,
+                    VerificationErrorRelation.NEW_SEMANTIC_FAILURE,
+                }
+            ):
+                decision = EscalationDecision(
+                    action="repair",
+                    should_escalate=False,
+                    should_repair=True,
+                    from_level=ContextLevel.MINIMAL,
+                    to_level=ContextLevel.MINIMAL,
+                    reason_code="schema_unavailable_source_fallback",
+                    reason=(
+                        "Provider schema was unavailable; continue with bounded "
+                        "Terraform source at the semantic diagnostic location."
+                    ),
+                    signals=[
+                        *decision.signals,
+                        "schema unavailable; diagnostic source selected safely",
+                    ][:8],
+                    verification_error_relation=decision.verification_error_relation,
+                )
+                second_attempt_reason = SecondAttemptReason.REPAIR
+                repair_reason = decision.reason_code
+            else:
+                decision = EscalationDecision(
+                    action="stop",
+                    should_escalate=False,
+                    should_repair=False,
+                    from_level=ContextLevel.MINIMAL,
+                    reason_code="schema_unavailable",
+                    reason=(
+                        "Schema escalation was indicated, but no usable provider resource "
+                        "schema or safe diagnostic source could be retrieved."
+                    ),
+                    signals=[
+                        *decision.signals,
+                        "schema retrieval returned no usable slice",
+                    ][:8],
+                    verification_error_relation=decision.verification_error_relation,
+                )
     elif decision.action == "repair":
         second_attempt_reason = SecondAttemptReason.REPAIR
         if (
@@ -1435,7 +1484,11 @@ def diagnose_repository(
             (
                 "successful_minimal_verification"
                 if not schema_retrieval_attempted
-                else "schema_retrieved"
+                else (
+                    "schema_retrieved"
+                    if schema_retrieved
+                    else "schema_unavailable_source_fallback"
+                )
             )
             if context_mode == "auto"
             and verification_status

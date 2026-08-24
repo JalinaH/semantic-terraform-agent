@@ -103,6 +103,8 @@ EscalationReasonCode: TypeAlias = Literal[
     "ambiguous_resource",
     "unresolved_schema_identifier",
     "verification_semantic_failure",
+    "terraform_language_semantic_failure",
+    "schema_unavailable_source_fallback",
     "multiple_candidate_resources",
     "unresolved_supporting_symbol",
     "minimal_patch_failed_semantically",

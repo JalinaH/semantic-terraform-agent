@@ -4,6 +4,7 @@ from pathlib import Path
 
 from semantic_terraform_agent.models import (
     ModelDiagnosis,
+    PatchFailureCategory,
     ProviderResponse,
     SchemaRecord,
     TerraformInfo,
@@ -17,6 +18,7 @@ from semantic_terraform_agent.reasoning.prompts import (
     build_prompt_parts,
     build_repair_prompt_parts,
 )
+from semantic_terraform_agent.terraform.plan_diagnostics import classify_plan_failure
 
 
 INITIAL_PATCH = (
@@ -396,7 +398,7 @@ def test_environment_failure_stops_without_schema_or_second_model(
     assert result.diagnosis.verification_status == "verification_unavailable"
 
 
-def test_schema_unavailable_after_semantic_signal_stops_without_unchanged_rerun(
+def test_schema_unavailable_uses_safe_diagnostic_source_repair(
     terraform_repo: Path,
     failure_log: Path,
     diff_file: Path,
@@ -418,26 +420,47 @@ def test_schema_unavailable_after_semantic_signal_stops_without_unchanged_rerun(
 
     def verifier(patch, layout, *, attempt):
         events.append(f"verify_{attempt}")
-        return _attempt(
+        if attempt == 2:
+            return _attempt(patch, attempt, status="verified")
+        result = _attempt(
             patch,
             attempt,
             status="failed",
             stage="plan",
-            output="Error: Invalid value for argument mode",
+            output='''{"type":"diagnostic","diagnostic":{"severity":"error","summary":"Unsupported argument","detail":"Argument mode is unsupported.","range":{"filename":"main.tf","start":{"line":2}},"address":"example_widget.primary"}}''',
+        )
+        return result.model_copy(
+            update={
+                "plan_failure": classify_plan_failure(result.commands.plan),
+                "failure_category": PatchFailureCategory.SEMANTIC_VERIFICATION_FAILURE,
+                "failure_reason_code": "terraform_verification_failure",
+            }
         )
 
     result = _run(terraform_repo, failure_log, diff_file, provider, verifier)
 
-    assert events == ["diagnose", "verify_1", "schema_retrieval"]
-    assert provider.repair_calls == 0
-    assert result.context_progression.reason_code == "schema_unavailable"
+    assert events == [
+        "diagnose",
+        "verify_1",
+        "schema_retrieval",
+        "second_model",
+        "verify_2",
+    ]
+    assert provider.repair_calls == 1
+    assert result.context_progression.reason_code == (
+        "schema_unavailable_source_fallback"
+    )
     assert result.context_progression.schema_retrieval_attempted is True
     assert result.context_progression.schema_retrieved is False
-    assert result.context_progression.schema_avoided is None
+    assert result.context_progression.schema_avoided is False
     assert result.context_progression.schema_avoidance_reason == (
-        "verification_not_successful"
+        "schema_unavailable_source_fallback"
     )
-    assert result.llm_usage.call_count == 1
+    assert result.llm_usage.call_count == 2
+    repair_prompt = build_repair_prompt_parts(provider.second_request).user
+    assert "TERRAFORM SOURCE AT PLAN DIAGNOSTIC LOCATION" in repair_prompt
+    assert "File: infrastructure/main.tf" in repair_prompt
+    assert 'mode = "fast"' in repair_prompt
 
 
 def test_explicit_schema_starts_with_slice_and_explicit_lightweight_never_escalates(

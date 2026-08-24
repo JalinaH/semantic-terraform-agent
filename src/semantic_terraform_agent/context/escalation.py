@@ -65,6 +65,12 @@ NETWORK_ERROR_PHRASES = (
     "tls handshake timeout",
 )
 
+TERRAFORM_LANGUAGE_PLAN_REASON_CODES = {
+    "resource_precondition_failed",
+    "resource_postcondition_failed",
+    "check_assertion_failed",
+}
+
 _TERM = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*")
 _ASSIGNMENT = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_-]*)\s*=\s*(.*)$")
 _STOP_TERMS = {
@@ -246,6 +252,20 @@ class ContextEscalationPolicy:
                 "syntactic_patch_failure",
                 "The candidate introduced a new syntax error that schema cannot resolve.",
                 signals,
+                relation,
+            )
+
+        if (
+            stage == "plan"
+            and verification.plan_failure is not None
+            and verification.plan_failure.reason_code
+            in TERRAFORM_LANGUAGE_PLAN_REASON_CODES
+        ):
+            return _repair(
+                level,
+                "terraform_language_semantic_failure",
+                "Terraform reported a language-level assertion failure; use source-backed semantic repair without provider schema.",
+                [*signals, "Terraform language assertion does not require provider schema"],
                 relation,
             )
 
