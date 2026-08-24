@@ -15,7 +15,12 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from semantic_terraform_agent.config import DEFAULT_LIMITS, ProviderError, validate_model_id
+from semantic_terraform_agent.config import (
+    DEFAULT_LIMITS,
+    DEFAULT_OPENROUTER_MODEL,
+    ProviderError,
+    validate_model_id,
+)
 from semantic_terraform_agent.models import (
     DiagnosisRequest,
     LLMCallType,
@@ -133,16 +138,30 @@ class OpenRouterProvider:
         response_model = (
             ModelDiagnosis if call_type is LLMCallType.DIAGNOSIS else SemanticEditSet
         )
+        enforce_structured_output = self.model != DEFAULT_OPENROUTER_MODEL
+        if not enforce_structured_output:
+            active_prompt = _json_fallback_prompt(prompt, response_model)
         try:
             payload = self._request_completion(
                 active_prompt,
                 api_key=api_key,
-                enforce_structured_output=True,
+                enforce_structured_output=enforce_structured_output,
                 response_model=response_model,
                 call_type=call_type,
             )
+            latency_ms = round((time.perf_counter() - started) * 1000)
+            return _provider_response(
+                payload,
+                requested_model=self.model,
+                call_type=call_type,
+                prompt=active_prompt,
+                latency_ms=latency_ms,
+            )
         except ProviderError as exc:
-            if exc.category is not ProviderFailureCategory.STRUCTURED_OUTPUT_UNSUPPORTED:
+            if exc.category not in {
+                ProviderFailureCategory.STRUCTURED_OUTPUT_UNSUPPORTED,
+                ProviderFailureCategory.RESPONSE_INVALID,
+            }:
                 raise
             active_prompt = _json_fallback_prompt(prompt, response_model)
             payload = self._request_completion(
@@ -340,6 +359,10 @@ def _classify_error(
             "json_schema",
             "required parameters",
             "required parameter",
+            "requested parameters",
+            "requested parameter",
+            "require_parameters",
+            "no endpoints found that support",
         )
     ):
         return ProviderFailureCategory.STRUCTURED_OUTPUT_UNSUPPORTED

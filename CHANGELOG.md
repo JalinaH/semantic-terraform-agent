@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.3
+
+- Recognize OpenRouter's current "requested parameters" incompatibility response and
+  fall back to schema-guided JSON without API-enforced structured output.
+- Retry one schema-invalid completion with the bounded JSON fallback prompt before
+  returning `response_invalid`.
+
 ## 1.1.2
 
 - Preserve the first-pass semantic diagnosis as immutable throughout repair,

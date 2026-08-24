@@ -209,9 +209,10 @@ def test_openrouter_repair_is_tagged_separately() -> None:
 
 
 def test_openrouter_repair_rejects_diagnosis_fields() -> None:
-    transport = FakeTransport(response(success_payload()))
+    transport = FakeTransport(response(success_payload()), response(success_payload()))
     with pytest.raises(ProviderError, match="invalid structured JSON"):
         provider(transport).repair(repair_request())
+    assert len(transport.calls) == 2
 
 
 def test_structured_output_unsupported_falls_back_to_strict_json_prompt() -> None:
@@ -235,6 +236,52 @@ def test_structured_output_unsupported_falls_back_to_strict_json_prompt() -> Non
     )
 
 
+def test_requested_parameters_wording_uses_json_fallback() -> None:
+    transport = FakeTransport(
+        response(
+            {
+                "error": {
+                    "code": 404,
+                    "message": "No endpoints found that support the requested parameters",
+                }
+            },
+            status=404,
+        ),
+        response(success_payload()),
+    )
+    result = provider(transport).diagnose(diagnosis_request())
+    assert result.diagnosis.root_cause == "mode is invalid"
+    assert len(transport.calls) == 2
+    assert "response_format" not in transport.calls[1]["body"]
+
+
+def test_free_router_starts_with_schema_guided_json_without_required_parameters() -> None:
+    transport = FakeTransport(response(success_payload()))
+    result = OpenRouterProvider(
+        "openrouter/free",
+        api_key="test-openrouter-key",
+        transport=transport,
+        max_retries=0,
+    ).diagnose(diagnosis_request())
+    assert result.diagnosis.root_cause == "mode is invalid"
+    assert len(transport.calls) == 1
+    assert "response_format" not in transport.calls[0]["body"]
+    assert "provider" not in transport.calls[0]["body"]
+    assert "Return exactly one JSON object matching this JSON Schema" in transport.calls[0][
+        "body"
+    ]["messages"][0]["content"]
+
+
+def test_invalid_structured_completion_gets_one_bounded_json_retry() -> None:
+    invalid = success_payload()
+    invalid["choices"][0]["message"]["content"] = "not json"
+    transport = FakeTransport(response(invalid), response(success_payload()))
+    result = provider(transport).diagnose(diagnosis_request())
+    assert result.diagnosis.root_cause == "mode is invalid"
+    assert len(transport.calls) == 2
+    assert "response_format" not in transport.calls[1]["body"]
+
+
 @pytest.mark.parametrize(
     "content",
     [
@@ -247,7 +294,9 @@ def test_invalid_openrouter_diagnosis_is_rejected(content: str) -> None:
     payload = success_payload()
     payload["choices"][0]["message"]["content"] = content
     with pytest.raises(ProviderError) as exc:
-        provider(FakeTransport(response(payload))).diagnose(diagnosis_request())
+        provider(FakeTransport(response(payload), response(payload))).diagnose(
+            diagnosis_request()
+        )
     assert exc.value.category is ProviderFailureCategory.RESPONSE_INVALID
 
 
