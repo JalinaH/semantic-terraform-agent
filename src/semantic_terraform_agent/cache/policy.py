@@ -27,6 +27,7 @@ class FailureMemoryPolicy:
         context: DiagnosisContext | None,
         *,
         verification_status: str,
+        verification_outcome: str,
         patch: str,
     ) -> bool:
         return bool(
@@ -36,6 +37,7 @@ class FailureMemoryPolicy:
             )
             and verification_status
             in {"verified_first_attempt", "verified_after_retry"}
+            and verification_outcome == "fully_verified"
             and patch.strip()
             and redact_secrets(patch) == patch
         )

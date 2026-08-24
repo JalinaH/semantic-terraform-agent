@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.1.4
+
+- Make Terraform plan the authoritative final verification gate and expose a bounded,
+  redacted deterministic plan-failure diagnostic.
+- Classify plan failures locally as Terraform semantic, credentials, permissions,
+  network, provider unavailable, external service, runtime environment, or unknown.
+- Add an additive verification assessment with explicit full, environment-blocked,
+  semantic, patch-invalid, and fail-closed unknown outcomes.
+- Allow conditional mutation eligibility only for confidently environmental plan
+  failures after every existing provenance, scope, and pre-plan verification gate passes.
+- Keep Verified Failure Memory restricted to complete plan success and avoid model repair
+  calls for environmental or unknown plan failures.
+
 ## 1.1.3
 
 - Recognize OpenRouter's current "requested parameters" incompatibility response and

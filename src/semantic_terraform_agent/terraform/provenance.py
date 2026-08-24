@@ -18,9 +18,11 @@ from semantic_terraform_agent.models import (
     MutationEligibility,
     SourceProvenance,
     TerraformInfo,
+    VerificationAssessment,
     VerificationProvenance,
     VerifiedPatchArtifact,
 )
+from semantic_terraform_agent.terraform.assessment import assess_verification
 from semantic_terraform_agent.terraform.verification import (
     UnsafePatchError,
     inspect_patch,
@@ -81,6 +83,7 @@ def build_verified_patch_contract(
     layout: RepositoryLayout,
     source: SourceProvenance,
     terraform: TerraformInfo,
+    assessment: VerificationAssessment | None = None,
 ) -> tuple[
     VerifiedPatchArtifact,
     SourceProvenance,
@@ -89,6 +92,7 @@ def build_verified_patch_contract(
 ]:
     """Build the additive artifact and conservative platform-eligibility contract."""
     final_attempt = diagnosis.attempts[-1]
+    assessment = assessment or assess_verification(final_attempt)
     patch = diagnosis.final_patch
     patch_hash = hashlib.sha256(patch.encode("utf-8")).hexdigest() if patch else None
     details: list[str] = []
@@ -147,7 +151,10 @@ def build_verified_patch_contract(
         update={"source_fingerprint_sha256": source_fingerprint}
     )
     verification = _verification_provenance(diagnosis, terraform)
-    if not _verification_complete(verification):
+    if not (
+        _verification_complete(verification)
+        or _conditional_verification_complete(verification, assessment)
+    ):
         details.append("verification_provenance_incomplete")
     if source.working_tree_mode == "git_dirty":
         details.append("working_tree_not_clean")
@@ -173,6 +180,7 @@ def build_verified_patch_contract(
         unsupported_operation=unsupported_operation,
         verified_patch_mismatch=verified_patch_mismatch,
         details=details,
+        assessment=assessment,
     )
     return artifact, source, verification, eligibility
 
@@ -198,6 +206,9 @@ def _verification_provenance(
         fmt_passed=_passed(commands.fmt),
         init_passed=_passed(commands.init),
         validate_passed=_passed(commands.terraform_validate),
+        plan_attempted=bool(
+            commands.plan is not None and commands.plan.status != "skipped"
+        ),
         plan_passed=_passed(commands.plan),
         terraform_version=terraform.version,
         provider_versions=dict(sorted(provider_versions.items())),
@@ -213,21 +224,12 @@ def _mutation_eligibility(
     unsupported_operation: bool,
     verified_patch_mismatch: bool,
     details: list[str],
+    assessment: VerificationAssessment,
 ) -> MutationEligibility:
     status = artifact.verification_status
     if not patch:
         reason = "no_patch"
         details.append("patch_empty")
-    elif status == "patch_rejected":
-        reason = "patch_rejected"
-    elif status == "verification_failed":
-        reason = "verification_failed"
-    elif status == "verification_unavailable":
-        reason = "verification_unavailable"
-    elif status == "verification_skipped":
-        reason = "verification_skipped"
-    elif not artifact.verification_passed or not _verification_complete(verification):
-        reason = "not_verified"
     elif artifact.patch_sha256 is None:
         reason = "patch_hash_unavailable"
     elif not artifact.affected_files or not artifact.repository_relative_paths_only:
@@ -242,11 +244,35 @@ def _mutation_eligibility(
         reason = "unsafe_patch"
     elif source.verified_against_commit_sha is None:
         reason = "source_revision_unknown"
-    else:
+    elif (
+        assessment.outcome == "fully_verified"
+        and artifact.verification_passed
+        and _verification_complete(verification)
+    ):
         reason = "verified_terraform_patch"
-    eligible = reason == "verified_terraform_patch"
+    elif (
+        assessment.outcome == "environment_blocked"
+        and _conditional_verification_complete(verification, assessment)
+    ):
+        reason = "terraform_plan_environment_blocked"
+    elif status == "patch_rejected":
+        reason = "patch_rejected"
+    elif status == "verification_failed":
+        reason = "verification_failed"
+    elif status == "verification_unavailable":
+        reason = "verification_unavailable"
+    elif status == "verification_skipped":
+        reason = "verification_skipped"
+    else:
+        reason = "not_verified"
+    eligibility_level = {
+        "verified_terraform_patch": "verified",
+        "terraform_plan_environment_blocked": "conditional",
+    }.get(reason, "ineligible")
+    eligible = eligibility_level in {"verified", "conditional"}
     return MutationEligibility(
         eligible=eligible,
+        eligibility_level=eligibility_level,
         reason_code=reason,
         reasons=list(dict.fromkeys(details)),
         requires_fresh_head_check=True,
@@ -263,6 +289,36 @@ def _verification_complete(value: VerificationProvenance) -> bool:
             value.init_passed,
             value.validate_passed,
             value.plan_passed,
+        )
+    )
+
+
+def _conditional_verification_complete(
+    value: VerificationProvenance,
+    assessment: VerificationAssessment,
+) -> bool:
+    plan_failure = assessment.plan_failure
+    if plan_failure is None:
+        return False
+    return all(
+        (
+            assessment.outcome == "environment_blocked",
+            plan_failure.classification
+            in {
+                "credentials",
+                "permissions",
+                "network",
+                "provider_unavailable",
+                "external_service",
+                "runtime_environment",
+            },
+            value.patch_check_passed,
+            value.patch_apply_passed,
+            value.fmt_passed,
+            value.init_passed,
+            value.validate_passed,
+            value.plan_attempted,
+            not value.plan_passed,
         )
     )
 

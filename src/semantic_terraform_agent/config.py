@@ -55,6 +55,10 @@ class Limits:
     max_semantic_edit_aggregate_chars: int = 24_000
     max_structured_repair_output_tokens: int = 2_048
     max_verification_output_chars: int = 8_000
+    max_plan_failure_summary_chars: int = 500
+    max_plan_failure_detail_chars: int = 2_000
+    max_plan_failure_source_chars: int = 512
+    max_plan_failure_resource_chars: int = 512
     max_diagnostic_context_chars: int = 4_000
     max_relevant_diff_chars: int = 6_000
     max_resource_block_chars: int = 12_000

@@ -105,6 +105,7 @@ from semantic_terraform_agent.reasoning.usage import (
 )
 from semantic_terraform_agent.security import redact_secrets
 from semantic_terraform_agent.terraform.discovery import select_context_mode
+from semantic_terraform_agent.terraform.assessment import assess_verification
 from semantic_terraform_agent.terraform.resources import detect_resources
 from semantic_terraform_agent.terraform.schema import (
     inspect_schemas,
@@ -404,7 +405,7 @@ def diagnose_repository(
     cache_store: LocalCacheStore | None = None,
 ) -> ResultDocument:
     if max_repair_attempts not in (0, 1):
-        raise InputError("max_repair_attempts must be 0 or 1 in version 1.1.3")
+        raise InputError("max_repair_attempts must be 0 or 1 in version 1.1.4")
     selected_provider = parse_provider_name(provider_name)
     total_start = time.perf_counter()
     timing: dict[str, float] = {
@@ -590,12 +591,24 @@ def diagnose_repository(
                 timing["verification_seconds"] = timing[
                     "initial_verification_seconds"
                 ]
-                if reuse_attempt.status == "verified":
+                reuse_assessment = assess_verification(reuse_attempt)
+                if reuse_assessment.outcome in {
+                    "fully_verified",
+                    "environment_blocked",
+                }:
+                    memory_fully_verified = (
+                        reuse_assessment.outcome == "fully_verified"
+                    )
+                    memory_verification_status = _final_status([reuse_attempt])
                     memory_telemetry = memory_telemetry.model_copy(
                         update={
-                            "status": "hit_verified",
+                            "status": (
+                                "hit_verified"
+                                if memory_fully_verified
+                                else "hit_environment_blocked"
+                            ),
                             "reused": True,
-                            "fresh_verification_passed": True,
+                            "fresh_verification_passed": memory_fully_verified,
                             "reuse_attempt": reuse_attempt,
                             "llm_calls_avoided": 1,
                             "historical_input_tokens_avoided": memory_entry.historical_input_tokens,
@@ -612,11 +625,11 @@ def diagnose_repository(
                         initial=memory_entry.diagnosis,
                         attempts=[reuse_attempt],
                         final_patch=reuse_attempt.patch,
-                        verification_status="verified_first_attempt",
+                        verification_status=memory_verification_status,
                         model_confidence=memory_entry.diagnosis.model_confidence,
                         evidence_score=memory_entry.evidence_score,
                         verification=_verification_signal(
-                            "verified_first_attempt", reuse_attempt
+                            memory_verification_status, reuse_attempt
                         ),
                         candidate_representation="legacy_diff",
                         patch_construction=PatchConstruction(
@@ -624,6 +637,7 @@ def diagnose_repository(
                             edit_count=0,
                         ),
                     )
+                    verification_assessment = reuse_assessment
                     timing["total_seconds"] = _elapsed(total_start)
                     zero_usage = LLMUsage(
                         call_count=0,
@@ -648,16 +662,32 @@ def diagnose_repository(
                         final_level=ContextLevel.MINIMAL,
                         levels_used=[ContextLevel.MINIMAL],
                         escalated=False,
-                        reason_code="verification_passed",
+                        reason_code=(
+                            "verification_passed"
+                            if memory_fully_verified
+                            else "environment_unavailable"
+                        ),
                         reason=(
                             "An exact repository-scoped verified-memory candidate "
-                            "passed fresh isolated verification."
+                            + (
+                                "passed fresh isolated verification."
+                                if memory_fully_verified
+                                else "passed all pre-plan gates, but fresh plan was environment-blocked."
+                            )
                         ),
                         schema_retrieval_attempted=False,
                         schema_retrieved=False,
-                        schema_avoided=True if context_mode == "auto" else None,
+                        schema_avoided=(
+                            memory_fully_verified
+                            if context_mode == "auto"
+                            else None
+                        ),
                         schema_avoidance_reason=(
-                            "successful_minimal_verification"
+                            (
+                                "successful_minimal_verification"
+                                if memory_fully_verified
+                                else "verification_stopped_before_schema_decision"
+                            )
                             if context_mode == "auto"
                             else None
                         ),
@@ -679,6 +709,7 @@ def diagnose_repository(
                         layout=layout,
                         source=source_provenance,
                         terraform=memory_terraform,
+                        assessment=verification_assessment,
                     )
                     return ResultDocument(
                         status="ok",
@@ -709,6 +740,7 @@ def diagnose_repository(
                         verified_patch=verified_patch,
                         source_provenance=source_provenance,
                         verification_provenance=verification_provenance,
+                        verification_assessment=verification_assessment,
                         mutation_eligibility=mutation_eligibility,
                         warnings=warnings,
                     )
@@ -1273,6 +1305,7 @@ def diagnose_repository(
         candidate_representation=final_candidate_patch.representation,
         patch_construction=final_candidate_patch.construction,
     )
+    verification_assessment = assess_verification(final_attempt)
 
     llm_usage = aggregate_usage(llm_calls)
     if (
@@ -1282,6 +1315,7 @@ def diagnose_repository(
         and memory_policy.eligible_for_store(
             diagnosis_context,
             verification_status=verification_status,
+            verification_outcome=verification_assessment.outcome,
             patch=diagnosis.final_patch,
         )
     ):
@@ -1464,6 +1498,7 @@ def diagnose_repository(
         layout=layout,
         source=source_provenance,
         terraform=terraform_info,
+        assessment=verification_assessment,
     )
     return ResultDocument(
         status="ok",
@@ -1501,6 +1536,7 @@ def diagnose_repository(
         verified_patch=verified_patch,
         source_provenance=source_provenance,
         verification_provenance=verification_provenance,
+        verification_assessment=verification_assessment,
         mutation_eligibility=mutation_eligibility,
         warnings=warnings,
     )

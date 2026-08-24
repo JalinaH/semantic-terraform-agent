@@ -261,30 +261,45 @@ def _print_summary(result: ResultDocument, output: Path) -> None:
             "  Source revision:  "
             f"{artifact.verified_against_commit_sha or 'not available'}"
         )
-        print(f"  Apply eligible:   {'yes' if eligibility.eligible else 'no'}")
-        if not eligibility.eligible:
-            print(f"  Reason:           {eligibility.reason_code}")
-    print("Final verification:")
-    print(f"  {diagnosis.verification.status.replace('_', ' ').upper()}")
-    if diagnosis.verification.reason:
-        print("Reason:")
-        print(f"  {diagnosis.verification.reason}")
-    final_attempt = diagnosis.attempts[-1]
-    for name, label in (
-        ("fmt", "terraform fmt"),
-        ("init", "terraform init"),
-        ("terraform_validate", "terraform validate"),
-        ("plan", "terraform plan"),
-    ):
-        command = getattr(final_attempt.commands, name)
-        if command is not None:
-            display = {
-                "passed": "PASS",
-                "failed": "FAIL",
-                "skipped": "SKIP",
-                "error": "ERROR",
-            }[command.status]
-            print(f"{label:<18} {display}")
+    assessment = result.verification_assessment
+    if assessment is not None:
+        print(
+            "Terraform verification: "
+            f"{assessment.outcome.replace('_', ' ').upper()}"
+        )
+        final_attempt = diagnosis.attempts[-1]
+        for name, label in (
+            ("patch_check", "Patch check"),
+            ("patch_apply", "Patch apply"),
+            ("fmt", "Terraform fmt"),
+            ("init", "Terraform init"),
+            ("terraform_validate", "Terraform validate"),
+            ("plan", "Terraform plan"),
+        ):
+            command = getattr(final_attempt.commands, name)
+            display = (
+                "NOT RUN"
+                if command is None
+                else {
+                    "passed": "PASSED",
+                    "failed": "FAILED",
+                    "skipped": "SKIPPED",
+                    "error": "ERROR",
+                }[command.status]
+            )
+            print(f"{label}: {display}")
+        if assessment.plan_failure is not None:
+            print("Plan failure:")
+            print(f"  Class:  {assessment.plan_failure.classification}")
+            print(f"  Reason: {assessment.plan_failure.detail}")
+        eligibility = result.mutation_eligibility
+        level = eligibility.eligibility_level if eligibility is not None else "ineligible"
+        print(f"Apply eligibility: {level.upper()}")
+        if eligibility is not None and not eligibility.eligible:
+            print(f"Eligibility reason: {eligibility.reason_code}")
+    else:
+        print("Final verification:")
+        print(f"  {diagnosis.verification.status.replace('_', ' ').upper()}")
     usage = result.llm_usage
     requested_model = result.llm_calls[0].requested_model if result.llm_calls else "not reported"
     provider = result.llm_calls[0].provider.value if result.llm_calls else "not reported"

@@ -11,6 +11,7 @@ from semantic_terraform_agent.config import InputError
 from semantic_terraform_agent.models import (
     Diagnosis,
     DiagnosisCandidate,
+    PlanFailure,
     TerraformInfo,
     VerificationAttempt,
     VerificationCommand,
@@ -137,6 +138,7 @@ def test_verified_existing_terraform_patch_is_eligible(terraform_repo: Path) -> 
     assert verification.plan_passed is True
     assert eligibility.model_dump() == {
         "eligible": True,
+        "eligibility_level": "verified",
         "reason_code": "verified_terraform_patch",
         "reasons": [],
         "requires_fresh_head_check": True,
@@ -309,6 +311,51 @@ def test_non_terraform_new_delete_and_rename_are_conservatively_ineligible(
         *_, eligibility = _contract(terraform_repo, _diagnosis(patch))
         assert eligibility.eligible is False
         assert eligibility.reason_code == reason
+
+
+def test_environment_blocked_plan_cannot_override_unsafe_patch_scope(
+    terraform_repo: Path,
+) -> None:
+    _git_commit(terraform_repo)
+    patch = "--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-old\n+new\n"
+    diagnosis = _diagnosis(
+        patch,
+        status="verification_unavailable",
+        attempt_status="unavailable",
+    )
+    passed = _passed()
+    plan = VerificationCommand(
+        command=["terraform", "plan", "-json"],
+        status="failed",
+        exit_code=1,
+        stderr="AccessDenied",
+    )
+    failure = PlanFailure(
+        classification="permissions",
+        reason_code="aws_access_denied",
+        summary="AccessDenied",
+        detail="The caller is not authorized to perform the requested action.",
+        diagnostic_format="bounded_text",
+    )
+    attempt = diagnosis.attempts[0].model_copy(
+        update={
+            "failed_stage": "plan",
+            "commands": VerificationCommands(
+                patch_check=passed,
+                patch_apply=passed,
+                fmt=passed,
+                init=passed,
+                validate=passed,
+                plan=plan,
+            ),
+            "plan_failure": failure,
+        }
+    )
+    diagnosis = diagnosis.model_copy(update={"attempts": [attempt]})
+    *_, eligibility = _contract(terraform_repo, diagnosis)
+    assert eligibility.eligible is False
+    assert eligibility.eligibility_level == "ineligible"
+    assert eligibility.reason_code == "non_terraform_files"
 
 
 def test_patch_inspection_reports_create_delete_and_rename() -> None:

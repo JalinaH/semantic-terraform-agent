@@ -166,6 +166,18 @@ class ContextEscalationPolicy:
                 signals,
                 relation,
             )
+        if (
+            verification.failed_stage == "plan"
+            and verification.plan_failure is not None
+            and verification.plan_failure.classification == "unknown"
+        ):
+            return _stop(
+                level,
+                "no_actionable_failure",
+                "Terraform plan failed for an unclassified reason; fail closed without another model call.",
+                signals,
+                relation,
+            )
         if not second_attempt_enabled:
             return _stop(
                 level,
@@ -307,6 +319,13 @@ def classify_verification_error(
         return VerificationErrorRelation.ENVIRONMENT_FAILURE
     output = _failed_output(verification)
     lowered = output.lower()
+    if verification.plan_failure is not None:
+        if verification.plan_failure.classification == "terraform_semantic":
+            if _same_failure(failure, output, verification.failed_stage):
+                return VerificationErrorRelation.SAME_FAILURE
+            return VerificationErrorRelation.NEW_SEMANTIC_FAILURE
+        if verification.plan_failure.classification == "unknown":
+            return VerificationErrorRelation.UNKNOWN
     if any(phrase in lowered for phrase in (*CREDENTIAL_ERROR_PHRASES, *NETWORK_ERROR_PHRASES)):
         return VerificationErrorRelation.ENVIRONMENT_FAILURE
     if any(phrase in lowered for phrase in SYNTACTIC_ERROR_PHRASES):

@@ -4,7 +4,7 @@ Semantic Terraform Agent diagnoses Terraform CI failures, generates a candidate 
 and verifies that patch in an isolated temporary workspace. It supports arbitrary
 Terraform repositories and does not contain benchmark-specific resource logic.
 
-Version: `1.1.2`
+Version: `1.1.4`
 
 ## How it works
 
@@ -119,7 +119,8 @@ stage, resource identity, exact selected evidence, Terraform source, Terraform/p
 version evidence, policy versions, and context budgets.
 
 Only patches that previously reached `verified_first_attempt` or
-`verified_after_retry` can be stored. A hit means a candidate exists—not that it is
+`verified_after_retry` with a complete successful Terraform plan can be stored.
+Environment-blocked results are never stored as verified fixes. A hit means a candidate exists—not that it is
 trusted. Every remembered patch is freshly applied and verified in a new temporary copy.
 Stale, corrupt, ambiguous, or unsafe entries fall back to the complete normal pipeline.
 
@@ -155,13 +156,38 @@ Version 1.1 adds four backward-compatible top-level fields:
 - `mutation_eligibility` is a deterministic advisory contract for a higher-level
   platform. It never causes repository mutation.
 
-Eligibility requires a non-empty hashed patch, an exact clean Git revision, safe
+Verified eligibility requires a non-empty hashed patch, an exact clean Git revision, safe
 existing-file modifications confined to `.tf`/`.tf.json` files in the configured
 Terraform directory, and a freshly successful isolated verification through plan.
 New files, deletions, renames, binary changes, non-Terraform files, dirty/non-Git
-source, skipped/unavailable verification, and incomplete verification provenance are
-ineligible. A remembered patch is evaluated from scratch after fresh verification;
+source, skipped verification, semantic failure, unknown failure, and incomplete
+verification provenance are ineligible. A remembered patch is evaluated from scratch after fresh verification;
 stored eligibility is never trusted.
+
+### Authoritative Terraform plan outcomes
+
+Version 1.1.4 keeps `terraform plan` as the strongest verification gate. Plan runs with
+`-input=false`, `-lock=false`, `-refresh=false`, `-no-color`, and machine-readable JSON
+diagnostics enabled; it never saves or applies a plan. A full patch check, patch apply,
+fmt, init, validate, and plan pass produces `verification_assessment.outcome` =
+`fully_verified` and the existing verified mutation eligibility.
+
+When plan fails, the result retains only a bounded and redacted `plan_failure` containing
+classification, reason code, summary, detail, safe source location, resource address, and
+whether Terraform JSON or bounded text supplied the diagnostic. Classification is local
+and deterministic—no model decides whether a failure is semantic or environmental.
+Supported classes are `terraform_semantic`, `credentials`, `permissions`, `network`,
+`provider_unavailable`, `external_service`, `runtime_environment`, and `unknown`.
+
+A confidently environmental or external plan failure produces `environment_blocked`.
+It may be conditionally mutation-eligible only when patch check/application, fmt, init,
+and validate passed; plan was attempted; the patch is an existing-file Terraform-only
+change; its SHA-256 is valid; and the repository is anchored to a clean Git revision.
+This is explicitly not full verification and is never written to Verified Failure
+Memory. Semantic plan failures remain ineligible and may use the existing bounded second
+semantic call. Unknown failures fail closed, remain ineligible, and do not consume a
+speculative repair call. The original model diagnosis, confidence, and evidence remain
+immutable in every case.
 
 On successful warm reuse, `resolution_source` is `verified_failure_memory`, `llm_calls`
 is empty, and current-run model usage is zero. Historical avoided usage is reported only
@@ -249,7 +275,7 @@ The production workflow is:
 ```yaml
 jobs:
   diagnose:
-    uses: JalinaH/semantic-terraform-agent/.github/workflows/terraform-agent.yml@v1.1.2
+    uses: JalinaH/semantic-terraform-agent/.github/workflows/terraform-agent.yml@v1.1.4
     permissions:
       contents: read
       id-token: write

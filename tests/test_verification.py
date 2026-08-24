@@ -40,6 +40,8 @@ def test_production_code_contains_no_repository_or_terraform_mutation_commands()
         ("git", "merge"),
         ("terraform", "apply"),
         ("terraform", "destroy"),
+        ("terraform", "import"),
+        ("terraform", "taint"),
     ):
         pattern = rf"[\"']{executable}[\"']\s*,\s*[\"']{command}[\"']"
         assert re.search(pattern, production) is None
@@ -135,6 +137,7 @@ def test_successful_plan_verification_uses_exact_safe_flags(
         "-lock=false",
         "-refresh=false",
         "-no-color",
+        "-json",
     ]
     assert [command[0] for command, _ in calls] == [
         "git",
@@ -258,7 +261,8 @@ def test_plan_failure_records_first_failing_stage(
     assert result.status == "failed"
     assert result.failed_stage == "plan"
     assert result.commands.plan.status == "failed"
-    assert result.failure_category is PatchFailureCategory.SEMANTIC_VERIFICATION_FAILURE
+    assert result.failure_category is PatchFailureCategory.UNKNOWN
+    assert result.plan_failure.classification == "unknown"
 
 
 def test_plan_not_executed_when_validate_fails(

@@ -517,8 +517,68 @@ FinalVerificationStatus: TypeAlias = Literal[
     "verification_skipped",
 ]
 
+PlanFailureClassification: TypeAlias = Literal[
+    "terraform_semantic",
+    "credentials",
+    "permissions",
+    "network",
+    "provider_unavailable",
+    "external_service",
+    "runtime_environment",
+    "unknown",
+]
+
+PlanFailureReasonCode: TypeAlias = Literal[
+    "invalid_variable_value",
+    "invalid_expression",
+    "unsupported_argument",
+    "conflicting_arguments",
+    "invalid_index_or_key",
+    "invalid_resource_configuration",
+    "invalid_provider_configuration",
+    "provider_schema_constraint",
+    "missing_required_argument",
+    "invalid_terraform_reference",
+    "aws_no_credentials",
+    "aws_expired_credentials",
+    "aws_invalid_security_token",
+    "authentication_failed",
+    "aws_access_denied",
+    "aws_unauthorized_operation",
+    "explicit_deny",
+    "permission_denied",
+    "dns_resolution_failed",
+    "connection_timeout",
+    "connection_refused",
+    "connection_reset",
+    "tls_connectivity_failed",
+    "network_unavailable",
+    "provider_service_unavailable",
+    "provider_plugin_unavailable",
+    "external_rate_limited",
+    "external_service_unavailable",
+    "runtime_dependency_unavailable",
+    "runtime_prerequisite_unavailable",
+    "unclassified_plan_failure",
+]
+
+VerificationOutcome: TypeAlias = Literal[
+    "fully_verified",
+    "environment_blocked",
+    "semantic_failure",
+    "patch_invalid",
+    "unknown_failure",
+]
+
+ApplySafety: TypeAlias = Literal[
+    "verified",
+    "conditionally_eligible",
+    "ineligible",
+]
+
 MutationEligibilityReasonCode: TypeAlias = Literal[
     "verified_terraform_patch",
+    "terraform_plan_environment_blocked",
     "not_verified",
     "patch_rejected",
     "verification_failed",
@@ -531,6 +591,31 @@ MutationEligibilityReasonCode: TypeAlias = Literal[
     "affected_files_unknown",
     "patch_hash_unavailable",
 ]
+
+
+class PlanFailure(StrictModel):
+    classification: PlanFailureClassification
+    reason_code: PlanFailureReasonCode
+    summary: str = Field(min_length=1, max_length=500)
+    detail: str = Field(min_length=1, max_length=2_000)
+    source_file: str | None = Field(default=None, max_length=512)
+    source_line: int | None = Field(default=None, ge=1)
+    resource_address: str | None = Field(default=None, max_length=512)
+    diagnostic_format: Literal["terraform_json", "bounded_text"]
+
+
+class VerificationAssessment(StrictModel):
+    outcome: VerificationOutcome
+    patch_check_passed: bool
+    patch_apply_passed: bool
+    fmt_passed: bool
+    init_passed: bool
+    validate_passed: bool
+    plan_attempted: bool
+    plan_passed: bool
+    full_verification_passed: bool
+    apply_safety: ApplySafety
+    plan_failure: PlanFailure | None = None
 
 MutationEligibilityDetailCode: TypeAlias = Literal[
     "patch_empty",
@@ -568,6 +653,7 @@ class VerificationAttempt(StrictModel):
     failure_description: str | None = Field(default=None, max_length=500)
     candidate_representation: Literal["structured_edit", "legacy_diff"] | None = None
     patch_construction_strategy: str | None = Field(default=None, max_length=80)
+    plan_failure: PlanFailure | None = None
 
 
 class SourceProvenance(StrictModel):
@@ -591,6 +677,7 @@ class VerificationProvenance(StrictModel):
     init_passed: bool
     validate_passed: bool
     plan_required: bool = True
+    plan_attempted: bool = False
     plan_passed: bool
     terraform_version: str | None = None
     provider_versions: dict[str, str] = Field(default_factory=dict)
@@ -614,6 +701,7 @@ class VerifiedPatchArtifact(StrictModel):
 
 class MutationEligibility(StrictModel):
     eligible: bool
+    eligibility_level: Literal["verified", "conditional", "ineligible"] = "ineligible"
     reason_code: MutationEligibilityReasonCode
     reasons: list[MutationEligibilityDetailCode] = Field(default_factory=list)
     requires_fresh_head_check: bool = True
@@ -793,6 +881,7 @@ CacheStatus: TypeAlias = Literal[
     "miss",
     "hit",
     "hit_verified",
+    "hit_environment_blocked",
     "hit_stale",
     "read_error",
     "write_error",
@@ -850,6 +939,7 @@ class ResultDocument(StrictModel):
     verified_patch: VerifiedPatchArtifact | None = None
     source_provenance: SourceProvenance | None = None
     verification_provenance: VerificationProvenance | None = None
+    verification_assessment: VerificationAssessment | None = None
     mutation_eligibility: MutationEligibility | None = None
     warnings: list[str] = Field(default_factory=list)
     error: str | None = None

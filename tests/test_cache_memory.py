@@ -20,11 +20,14 @@ from semantic_terraform_agent.terraform.resources import detect_resources
 from semantic_terraform_agent.cache.store import CacheStoreError, LocalCacheStore
 from semantic_terraform_agent.models import (
     ModelDiagnosis,
+    PatchFailureCategory,
+    PlanFailure,
     ProviderResponse,
     SchemaRecord,
     TerraformInfo,
     TokenUsage,
     VerificationAttempt,
+    VerificationCommand,
     VerificationCommands,
 )
 from semantic_terraform_agent.orchestration.diagnose import diagnose_repository
@@ -63,13 +66,61 @@ class CountingProvider:
 
 
 def _attempt(patch: str, attempt: int, status: str = "verified") -> VerificationAttempt:
+    passed = VerificationCommand(command=["test"], status="passed", exit_code=0)
+    commands = (
+        VerificationCommands(
+            patch_check=passed,
+            patch_apply=passed,
+            fmt=passed,
+            init=passed,
+            validate=passed,
+            plan=passed,
+        )
+        if status == "verified"
+        else VerificationCommands()
+    )
     return VerificationAttempt(
         attempt=attempt,
         patch=patch,
         status=status,
         failed_stage="patch_check" if status != "verified" else None,
-        commands=VerificationCommands(),
+        commands=commands,
         temporary_copy_cleaned=True,
+    )
+
+
+def _environment_plan_attempt(patch: str, attempt: int) -> VerificationAttempt:
+    passed = VerificationCommand(command=["test"], status="passed", exit_code=0)
+    plan = VerificationCommand(
+        command=["terraform", "plan", "-json"],
+        status="failed",
+        exit_code=1,
+        stderr="AccessDenied",
+    )
+    return VerificationAttempt(
+        attempt=attempt,
+        patch=patch,
+        status="unavailable",
+        failed_stage="plan",
+        changed_files=["infrastructure/main.tf"],
+        commands=VerificationCommands(
+            patch_check=passed,
+            patch_apply=passed,
+            fmt=passed,
+            init=passed,
+            validate=passed,
+            plan=plan,
+        ),
+        temporary_copy_cleaned=True,
+        failure_category=PatchFailureCategory.ENVIRONMENT_FAILURE,
+        failure_reason_code="environment_failure",
+        plan_failure=PlanFailure(
+            classification="permissions",
+            reason_code="aws_access_denied",
+            summary="AccessDenied",
+            detail="The caller is not authorized to perform the requested action.",
+            diagnostic_format="bounded_text",
+        ),
     )
 
 
@@ -128,7 +179,7 @@ def test_warm_verified_memory_uses_zero_llm_calls_and_fresh_verification(
     assert warm.verified_patch.candidate_source == "verified_failure_memory"
     assert warm.verified_patch.patch_sha256 is not None
     assert warm.mutation_eligibility.eligible is False
-    assert warm.mutation_eligibility.reason_code == "not_verified"
+    assert warm.mutation_eligibility.reason_code == "source_revision_unknown"
     assert warm.llm_calls == []
     assert warm.llm_usage.call_count == 0
     assert warm.llm_usage.input_tokens == 0
@@ -164,6 +215,37 @@ def test_warm_hit_bypasses_registry_and_provider_construction(
         repository_id="owner/repository",
     )
     assert result.resolution_source == "verified_failure_memory"
+
+
+def test_warm_memory_environment_block_does_not_spend_model_call(
+    terraform_repo: Path, failure_log: Path, diff_file: Path, tmp_path: Path
+) -> None:
+    store = LocalCacheStore(tmp_path / "cache")
+    provider = CountingProvider()
+    _run(
+        terraform_repo,
+        failure_log,
+        diff_file,
+        provider,
+        store,
+        lambda patch, layout, *, attempt: _attempt(patch, attempt),
+    )
+
+    result = _run(
+        terraform_repo,
+        failure_log,
+        diff_file,
+        provider,
+        store,
+        lambda patch, layout, *, attempt: _environment_plan_attempt(patch, attempt),
+    )
+
+    assert result.resolution_source == "verified_failure_memory"
+    assert result.cache.failure_memory.status == "hit_environment_blocked"
+    assert result.verification_assessment.outcome == "environment_blocked"
+    assert result.llm_usage.call_count == 0
+    assert result.llm_calls == []
+    assert provider.calls == 1
 
 
 def test_changed_relevant_source_invalidates_memory(

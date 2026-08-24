@@ -17,10 +17,15 @@ from semantic_terraform_agent.config import DEFAULT_LIMITS
 from semantic_terraform_agent.models import (
     PatchFailureCategory,
     PatchFailureReasonCode,
+    PlanFailure,
     VerificationAttempt,
     VerificationCommand,
     VerificationCommands,
     VerificationStage,
+)
+from semantic_terraform_agent.terraform.plan_diagnostics import (
+    classify_plan_failure,
+    is_environmental_plan_failure,
 )
 from semantic_terraform_agent.security import redact_secrets
 from semantic_terraform_agent.terraform.workspace import (
@@ -605,6 +610,7 @@ def _skip_after(
             "-lock=false",
             "-refresh=false",
             "-no-color",
+            "-json",
         ],
     }
     order = ("patch_apply", "fmt", "init", "validate", "plan")
@@ -626,6 +632,7 @@ def _attempt_result(
     warnings: list[str],
     cleaned: bool = True,
     failure: PatchFailureClassification | None = None,
+    plan_failure: PlanFailure | None = None,
 ) -> VerificationAttempt:
     return VerificationAttempt(
         attempt=attempt,
@@ -639,6 +646,7 @@ def _attempt_result(
         failure_category=failure.category if failure else None,
         failure_reason_code=failure.reason_code if failure else None,
         failure_description=failure.description if failure else None,
+        plan_failure=plan_failure,
     )
 
 
@@ -962,6 +970,7 @@ def verify_candidate_patch(
                 "-lock=false",
                 "-refresh=false",
                 "-no-color",
+                "-json",
             ],
             [
                 "terraform",
@@ -970,16 +979,37 @@ def verify_candidate_patch(
                 "-lock=false",
                 "-refresh=false",
                 "-no-color",
+                "-json",
             ],
             cwd=workdir,
             env=env,
         )
         if commands.plan.status != "passed":
-            unavailable = _environment_unavailable(commands.plan)
+            plan_failure = classify_plan_failure(commands.plan)
+            unavailable = is_environmental_plan_failure(plan_failure)
             reason = (
-                "terraform plan could not run because required environment access was unavailable."
+                f"Terraform plan was blocked by {plan_failure.classification}: "
+                f"{plan_failure.summary}"
                 if unavailable
-                else "terraform plan did not pass."
+                else f"Terraform plan failed: {plan_failure.summary}"
+            )
+            category = (
+                PatchFailureCategory.ENVIRONMENT_FAILURE
+                if unavailable
+                else (
+                    PatchFailureCategory.SEMANTIC_VERIFICATION_FAILURE
+                    if plan_failure.classification == "terraform_semantic"
+                    else PatchFailureCategory.UNKNOWN
+                )
+            )
+            reason_code: PatchFailureReasonCode = (
+                "environment_failure"
+                if unavailable
+                else (
+                    "terraform_verification_failure"
+                    if plan_failure.classification == "terraform_semantic"
+                    else "unknown_patch_failure"
+                )
             )
             return _attempt_result(
                 attempt=attempt,
@@ -990,18 +1020,11 @@ def verify_candidate_patch(
                 commands=commands,
                 warnings=[reason],
                 failure=_classification(
-                    (
-                        PatchFailureCategory.ENVIRONMENT_FAILURE
-                        if unavailable
-                        else PatchFailureCategory.SEMANTIC_VERIFICATION_FAILURE
-                    ),
-                    (
-                        "environment_failure"
-                        if unavailable
-                        else "terraform_verification_failure"
-                    ),
-                    reason,
+                    category,
+                    reason_code,
+                    plan_failure.detail or reason,
                 ),
+                plan_failure=plan_failure,
             )
 
         return _attempt_result(
