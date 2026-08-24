@@ -304,6 +304,17 @@ def _render_verification_evidence(request: RepairRequest) -> str:
         "FAILED VERIFICATION EVIDENCE",
         f"Stage: {request.failed_attempt.failed_stage}",
     ]
+    if request.failed_attempt.plan_failure is not None:
+        lines.extend(
+            (
+                "Bounded structured plan diagnostic:",
+                json.dumps(
+                    request.failed_attempt.plan_failure.model_dump(mode="json"),
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+            )
+        )
     if failed is None:
         return "\n".join(lines)
     output = redact_secrets(
@@ -375,6 +386,11 @@ def _build_legacy_repair_prompt_parts(request: RepairRequest) -> PromptParts:
             "reason_code": request.failed_attempt.failure_reason_code,
             "description": request.failed_attempt.failure_description,
         },
+        "plan_failure": (
+            request.failed_attempt.plan_failure.model_dump(mode="json")
+            if request.failed_attempt.plan_failure is not None
+            else None
+        ),
         "escalation_decision": (
             request.escalation_decision.model_dump(mode="json")
             if request.escalation_decision

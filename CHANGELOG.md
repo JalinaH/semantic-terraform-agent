@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.5
+
+- Classify Terraform resource precondition, postcondition, module-output
+  precondition, and check-block assertion failures as semantic plan failures.
+- Include the bounded structured plan diagnostic in the existing second-call repair
+  evidence so semantic candidates can be revised without changing diagnosis fields.
+
 ## 1.1.4
 
 - Make Terraform plan the authoritative final verification gate and expose a bounded,

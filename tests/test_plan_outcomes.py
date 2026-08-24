@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from semantic_terraform_agent.models import (
     VerificationCommands,
 )
 from semantic_terraform_agent.orchestration.diagnose import diagnose_repository
+from semantic_terraform_agent.reasoning.prompts import build_repair_prompt_parts
 from semantic_terraform_agent.terraform.plan_diagnostics import (
     classify_plan_failure,
     is_environmental_plan_failure,
@@ -305,6 +307,137 @@ def test_semantic_plan_failure_is_ineligible_and_can_use_one_repair(
     assert result.diagnosis.initial.model_confidence == (
         result.diagnosis.repair.model_confidence
     )
+
+
+def test_resource_precondition_plan_failure_uses_second_semantic_call(
+    terraform_repo: Path, failure_log: Path, diff_file: Path
+) -> None:
+    (terraform_repo / "infrastructure/main.tf").write_text(
+        '''variable "environment" {
+  type = number
+}
+
+resource "example_widget" "primary" {
+  mode = "fast"
+
+  lifecycle {
+    precondition {
+      condition     = self.mode == "slow"
+      error_message = "mode must be slow"
+    }
+  }
+}
+''',
+        encoding="utf-8",
+    )
+    commit = _commit(terraform_repo)
+
+    class PreconditionProvider:
+        def __init__(self) -> None:
+            self.diagnose_calls = 0
+            self.repair_calls = 0
+            self.repair_request = None
+
+        def diagnose(self, request):
+            self.diagnose_calls += 1
+            return ProviderResponse(
+                diagnosis=ModelDiagnosis(
+                    root_cause="The environment variable has the wrong Terraform type.",
+                    affected_resources=["example_widget.primary"],
+                    violated_constraint="environment must accept a string",
+                    edits=[
+                        {
+                            "file": "infrastructure/main.tf",
+                            "old_text": "  type = number",
+                            "new_text": "  type = string",
+                        }
+                    ],
+                    confidence=0.88,
+                    evidence=[
+                        {"source": "terraform_error", "detail": "invalid variable type"},
+                        {"source": "terraform_source", "detail": "type is number"},
+                    ],
+                ),
+                token_usage=TokenUsage(
+                    input_tokens=10, output_tokens=5, total_tokens=15
+                ),
+            )
+
+        def repair(self, request):
+            self.repair_calls += 1
+            self.repair_request = request
+            return ProviderResponse(
+                candidate_edit={
+                    "edits": [
+                        {
+                            "file": "infrastructure/main.tf",
+                            "old_text": "  type = number",
+                            "new_text": "  type = string",
+                        },
+                        {
+                            "file": "infrastructure/main.tf",
+                            "old_text": '  mode = "fast"',
+                            "new_text": '  mode = "slow"',
+                        },
+                    ]
+                },
+                token_usage=TokenUsage(
+                    input_tokens=12, output_tokens=6, total_tokens=18
+                ),
+            )
+
+    provider = PreconditionProvider()
+    diagnostic = json.dumps(
+        {
+            "type": "diagnostic",
+            "diagnostic": {
+                "severity": "error",
+                "summary": "Resource precondition failed",
+                "detail": "mode must be slow",
+                "range": {
+                    "filename": "infrastructure/main.tf",
+                    "start": {"line": 10, "column": 7, "byte": 150},
+                },
+                "address": "example_widget.primary",
+            },
+        }
+    )
+
+    def verifier(patch, layout, *, attempt):
+        assert '+  type = string' in patch
+        if attempt == 1:
+            assert '+  mode = "slow"' not in patch
+            return _failed_plan_attempt(patch, attempt, diagnostic)
+        assert '+  mode = "slow"' in patch
+        return _verified_attempt(patch, attempt)
+
+    result = _run(
+        terraform_repo,
+        failure_log,
+        diff_file,
+        provider,
+        verifier,
+        source_revision=commit,
+    )
+
+    first_failure = result.diagnosis.attempts[0].plan_failure
+    assert first_failure.classification == "terraform_semantic"
+    assert first_failure.reason_code == "resource_precondition_failed"
+    assert result.diagnosis.verification_status == "verified_after_retry"
+    assert result.verification_assessment.outcome == "fully_verified"
+    assert provider.diagnose_calls == provider.repair_calls == 1
+    assert result.llm_usage.call_count == 2
+    assert len(result.diagnosis.attempts) == 2
+    assert '+  type = string' in result.diagnosis.final_patch
+    assert '+  mode = "slow"' in result.diagnosis.final_patch
+
+    repair_prompt = build_repair_prompt_parts(provider.repair_request).user
+    assert '"summary":"Resource precondition failed"' in repair_prompt
+    assert '"detail":"mode must be slow"' in repair_prompt
+    assert '"source_file":"infrastructure/main.tf"' in repair_prompt
+    assert '"source_line":10' in repair_prompt
+    assert '"resource_address":"example_widget.primary"' in repair_prompt
+    assert "precondition {" in repair_prompt
 
 
 def test_semantic_and_unknown_terminal_plan_failures_are_ineligible(

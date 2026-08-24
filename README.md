@@ -4,7 +4,7 @@ Semantic Terraform Agent diagnoses Terraform CI failures, generates a candidate 
 and verifies that patch in an isolated temporary workspace. It supports arbitrary
 Terraform repositories and does not contain benchmark-specific resource logic.
 
-Version: `1.1.4`
+Version: `1.1.5`
 
 ## How it works
 
@@ -275,7 +275,7 @@ The production workflow is:
 ```yaml
 jobs:
   diagnose:
-    uses: JalinaH/semantic-terraform-agent/.github/workflows/terraform-agent.yml@v1.1.4
+    uses: JalinaH/semantic-terraform-agent/.github/workflows/terraform-agent.yml@v1.1.5
     permissions:
       contents: read
       id-token: write

@@ -405,7 +405,7 @@ def diagnose_repository(
     cache_store: LocalCacheStore | None = None,
 ) -> ResultDocument:
     if max_repair_attempts not in (0, 1):
-        raise InputError("max_repair_attempts must be 0 or 1 in version 1.1.4")
+        raise InputError("max_repair_attempts must be 0 or 1 in version 1.1.5")
     selected_provider = parse_provider_name(provider_name)
     total_start = time.perf_counter()
     timing: dict[str, float] = {

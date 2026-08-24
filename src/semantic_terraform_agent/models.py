@@ -529,6 +529,9 @@ PlanFailureClassification: TypeAlias = Literal[
 ]
 
 PlanFailureReasonCode: TypeAlias = Literal[
+    "resource_precondition_failed",
+    "resource_postcondition_failed",
+    "check_assertion_failed",
     "invalid_variable_value",
     "invalid_expression",
     "unsupported_argument",

@@ -39,6 +39,31 @@ from semantic_terraform_agent.terraform.plan_diagnostics import classify_plan_fa
         ("Error: Unsupported argument", "terraform_semantic", "unsupported_argument"),
         ("argument mode conflicts with region", "terraform_semantic", "conflicting_arguments"),
         ("Error: Invalid index", "terraform_semantic", "invalid_index_or_key"),
+        (
+            "Error: Resource precondition failed",
+            "terraform_semantic",
+            "resource_precondition_failed",
+        ),
+        (
+            "Error: precondition failed",
+            "terraform_semantic",
+            "resource_precondition_failed",
+        ),
+        (
+            "Error: Module output value precondition failed",
+            "terraform_semantic",
+            "resource_precondition_failed",
+        ),
+        (
+            "Error: postcondition failed",
+            "terraform_semantic",
+            "resource_postcondition_failed",
+        ),
+        (
+            "Error: Check block assertion failed",
+            "terraform_semantic",
+            "check_assertion_failed",
+        ),
         ("something happened while planning", "unknown", "unclassified_plan_failure"),
     ],
 )

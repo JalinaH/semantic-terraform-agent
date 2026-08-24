@@ -100,6 +100,16 @@ def _classify(
         (("no space left on device", "cannot allocate memory", "required environmental prerequisite"), "runtime_prerequisite_unavailable"),
     )
     semantic = (
+        (("check block assertion failed",), "check_assertion_failed"),
+        (("postcondition failed",), "resource_postcondition_failed"),
+        (
+            (
+                "resource precondition failed",
+                "module output value precondition failed",
+                "precondition failed",
+            ),
+            "resource_precondition_failed",
+        ),
         (("invalid value for variable", "invalid value for input variable", "invalid variable value"), "invalid_variable_value"),
         (("invalid expression", "invalid character", "syntax error", "unclosed configuration block"), "invalid_expression"),
         (("unsupported argument", "unsupported block type"), "unsupported_argument"),
