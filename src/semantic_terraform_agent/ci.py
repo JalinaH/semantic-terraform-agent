@@ -36,10 +36,17 @@ def _final_candidate(result: ResultDocument):
     return result.diagnosis.repair or result.diagnosis.initial
 
 
-def _command_line(label: str, command: VerificationCommand | None) -> str:
+def _command_line(
+    label: str,
+    command: VerificationCommand | None,
+    *,
+    not_requested: bool = False,
+) -> str:
+    if not_requested:
+        return f"- ⏭️ {label}: not requested"
     if command is None:
         return f"- — {label}: not run"
-    symbols = {"passed": "✓", "failed": "✗", "skipped": "—", "error": "!"}
+    symbols = {"passed": "✅", "failed": "❌", "skipped": "—", "error": "!"}
     return f"- {symbols[command.status]} {label}: {command.status}"
 
 
@@ -80,6 +87,10 @@ def render_pr_comment(result: ResultDocument, context: CIRenderContext) -> str:
     affected = ", ".join(candidate.affected_resources) or "not identified"
     final_attempt = diagnosis.attempts[-1] if diagnosis.attempts else None
     commands = final_attempt.commands if final_attempt is not None else None
+    assessment = result.verification_assessment
+    locally_validated = bool(
+        assessment is not None and assessment.outcome == "locally_validated"
+    )
 
     lines.extend(
         [
@@ -93,19 +104,38 @@ def render_pr_comment(result: ResultDocument, context: CIRenderContext) -> str:
             _bounded(candidate.violated_constraint),
             "",
             "### Terraform verification",
-            _command_line("patch applied in isolated workspace", commands.patch_apply if commands else None),
+            _command_line("patch check", commands.patch_check if commands else None),
+            _command_line("patch apply", commands.patch_apply if commands else None),
             _command_line("terraform fmt", commands.fmt if commands else None),
             _command_line("terraform init", commands.init if commands else None),
             _command_line(
                 "terraform validate", commands.terraform_validate if commands else None
             ),
-            _command_line("terraform plan", commands.plan if commands else None),
+            _command_line(
+                "terraform plan",
+                commands.plan if commands else None,
+                not_requested=locally_validated,
+            ),
             "",
-            f"**Final status:** {_status_label(diagnosis.verification_status)}",
+            f"**Final status:** {_status_label(assessment.outcome if locally_validated and assessment else diagnosis.verification_status)}",
             f"**Model confidence:** {diagnosis.model_confidence:.2f}",
             f"**Evidence score:** {diagnosis.evidence_score:.2f}",
             "",
-            "Terraform verification passed." if diagnosis.verification.passed else "Terraform verification did not pass.",
+            (
+                "TerraFix validated the patch locally. Provider-aware Terraform plan "
+                "verification was not run because cloud verification is not configured."
+                if locally_validated
+                else (
+                    "Terraform verification passed."
+                    if diagnosis.verification.passed
+                    else "Terraform verification did not pass."
+                )
+            ),
+            (
+                "Apply eligibility: Conditionally eligible after explicit human approval."
+                if locally_validated
+                else ""
+            ),
             "Human review is still required; verification does not establish developer intent.",
             "",
             "<details>",

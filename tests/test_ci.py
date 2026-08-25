@@ -7,7 +7,7 @@ from semantic_terraform_agent.ci import (
     render_pr_comment,
     render_step_summary,
 )
-from semantic_terraform_agent.models import ResultDocument
+from semantic_terraform_agent.models import ResultDocument, VerificationAssessment
 
 
 def result_document(
@@ -80,6 +80,7 @@ def result_document(
                         "failed_stage": None if passed else "plan",
                         "changed_files": ["infrastructure/main.tf"],
                         "commands": {
+                            "patch_check": command,
                             "patch_apply": command,
                             "fmt": command,
                             "init": command,
@@ -120,7 +121,7 @@ def test_pr_comment_contains_marker_and_verified_status() -> None:
     assert comment.startswith(COMMENT_MARKER)
     assert "aws_ebs_volume.example" in comment
     assert "VERIFIED AFTER RETRY" in comment
-    assert "✓ terraform plan: passed" in comment
+    assert "✅ terraform plan: passed" in comment
     assert "Human review is still required" in comment
     assert "<details>" in comment
 
@@ -139,6 +140,43 @@ def test_failed_verification_status_is_rendered_without_success_claim() -> None:
     )
     assert "VERIFICATION FAILED" in comment
     assert "Terraform verification did not pass." in comment
+    assert "Terraform verification passed." not in comment
+
+
+def test_locally_validated_comment_is_successful_but_does_not_claim_plan_passed() -> None:
+    result = result_document(
+        verification_status="locally_validated_first_attempt", passed=True
+    )
+    attempt = result.diagnosis.attempts[-1]
+    attempt.status = "locally_validated"
+    attempt.verification_mode = "local"
+    attempt.plan_requested = False
+    attempt.plan_skip_reason = "cloud_verification_not_configured"
+    attempt.commands.plan.status = "skipped"
+    result.verification_assessment = VerificationAssessment.model_validate({
+        "outcome": "locally_validated",
+        "verification_mode": "local",
+        "plan_requested": False,
+        "patch_check_passed": True,
+        "patch_apply_passed": True,
+        "fmt_passed": True,
+        "init_passed": True,
+        "validate_passed": True,
+        "plan_attempted": False,
+        "plan_passed": None,
+        "plan_skip_reason": "cloud_verification_not_configured",
+        "full_verification_passed": False,
+        "apply_safety": "conditionally_eligible",
+    })
+
+    comment = render_pr_comment(result, context())
+
+    assert "LOCALLY VALIDATED" in comment
+    assert "✅ patch check: passed" in comment
+    assert "✅ patch apply: passed" in comment
+    assert "⏭️ terraform plan: not requested" in comment
+    assert "cloud verification is not configured" in comment
+    assert "Conditionally eligible after explicit human approval" in comment
     assert "Terraform verification passed." not in comment
 
 

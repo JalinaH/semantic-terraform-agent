@@ -154,6 +154,7 @@ def build_verified_patch_contract(
     if not (
         _verification_complete(verification)
         or _conditional_verification_complete(verification, assessment)
+        or _local_verification_complete(verification, assessment)
     ):
         details.append("verification_provenance_incomplete")
     if source.working_tree_mode == "git_dirty":
@@ -199,17 +200,24 @@ def _verification_provenance(
         attempt_number=attempt.attempt,
         final_status=diagnosis.verification_status,
         verified_in_isolated_workspace=(
-            attempt.status == "verified" and attempt.isolation == "temporary-copy"
+            attempt.status in {"verified", "locally_validated"}
+            and attempt.isolation == "temporary-copy"
         ),
         patch_check_passed=_passed(commands.patch_check),
         patch_apply_passed=_passed(commands.patch_apply),
         fmt_passed=_passed(commands.fmt),
         init_passed=_passed(commands.init),
         validate_passed=_passed(commands.terraform_validate),
+        verification_mode=attempt.verification_mode,
+        plan_required=attempt.plan_requested,
+        plan_requested=attempt.plan_requested,
         plan_attempted=bool(
             commands.plan is not None and commands.plan.status != "skipped"
         ),
-        plan_passed=_passed(commands.plan),
+        plan_passed=(
+            _passed(commands.plan) if attempt.plan_requested else None
+        ),
+        plan_skip_reason=attempt.plan_skip_reason,
         terraform_version=terraform.version,
         provider_versions=dict(sorted(provider_versions.items())),
     )
@@ -255,6 +263,11 @@ def _mutation_eligibility(
         and _conditional_verification_complete(verification, assessment)
     ):
         reason = "terraform_plan_environment_blocked"
+    elif (
+        assessment.outcome == "locally_validated"
+        and _local_verification_complete(verification, assessment)
+    ):
+        reason = "locally_validated_terraform_patch"
     elif status == "patch_rejected":
         reason = "patch_rejected"
     elif status == "verification_failed":
@@ -268,6 +281,7 @@ def _mutation_eligibility(
     eligibility_level = {
         "verified_terraform_patch": "verified",
         "terraform_plan_environment_blocked": "conditional",
+        "locally_validated_terraform_patch": "conditional",
     }.get(reason, "ineligible")
     eligible = eligibility_level in {"verified", "conditional"}
     return MutationEligibility(
@@ -319,6 +333,29 @@ def _conditional_verification_complete(
             value.validate_passed,
             value.plan_attempted,
             not value.plan_passed,
+        )
+    )
+
+
+def _local_verification_complete(
+    value: VerificationProvenance,
+    assessment: VerificationAssessment,
+) -> bool:
+    return all(
+        (
+            assessment.outcome == "locally_validated",
+            value.verification_mode == "local",
+            not value.plan_required,
+            not value.plan_requested,
+            not value.plan_attempted,
+            value.plan_passed is None,
+            value.plan_skip_reason == "cloud_verification_not_configured",
+            value.verified_in_isolated_workspace,
+            value.patch_check_passed,
+            value.patch_apply_passed,
+            value.fmt_passed,
+            value.init_passed,
+            value.validate_passed,
         )
     )
 

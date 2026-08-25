@@ -89,6 +89,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="verify the candidate in a temporary copy (default: enabled)",
     )
     diagnose.add_argument(
+        "--verification-mode",
+        choices=("local", "full"),
+        default="full",
+        help=(
+            "local stops successfully after validate; full also requires terraform plan "
+            "(default: full)"
+        ),
+    )
+    diagnose.add_argument(
         "--max-repair-attempts",
         type=int,
         choices=(0, 1),
@@ -278,7 +287,9 @@ def _print_summary(result: ResultDocument, output: Path) -> None:
         ):
             command = getattr(final_attempt.commands, name)
             display = (
-                "NOT RUN"
+                "NOT REQUESTED"
+                if name == "plan" and not assessment.plan_requested
+                else "NOT RUN"
                 if command is None
                 else {
                     "passed": "PASSED",
@@ -486,6 +497,7 @@ def main(argv: list[str] | None = None) -> int:
             model=model,
             context_mode=args.context_mode,
             verification_enabled=args.verify_patch,
+            verification_mode=args.verification_mode,
             max_repair_attempts=args.max_repair_attempts,
             failed_stage=args.failed_stage,
             context_strategy=args.context_strategy,

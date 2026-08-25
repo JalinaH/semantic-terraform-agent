@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.2.0
+
+- Add explicit `local` and `full` verification modes while retaining `full` as the
+  backward-compatible default.
+- Treat patch check/application plus Terraform fmt, init, and validate as the distinct
+  successful `locally_validated` outcome when cloud verification is not configured.
+- Make locally validated patches conditionally mutation-eligible without weakening
+  provenance checks or admitting them to Verified Failure Memory.
+
 ## 1.1.6
 
 - Route Terraform precondition, postcondition, module-output precondition, and

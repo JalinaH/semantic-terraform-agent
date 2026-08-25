@@ -150,6 +150,95 @@ def test_successful_plan_verification_uses_exact_safe_flags(
     assert all(cwd != layout.terraform_root for _, cwd in calls)
 
 
+def test_successful_local_verification_never_constructs_plan_or_requires_aws(
+    monkeypatch, terraform_repo: Path
+) -> None:
+    layout = discover_repository(terraform_repo, Path("infrastructure"))
+    calls: list[list[str]] = []
+    for name in (
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    def fake_run(actual, recorded, *, cwd, env):
+        calls.append(recorded)
+        assert not any(name in env for name in (
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+        ))
+        return passed(recorded)
+
+    monkeypatch.setattr(verification_module, "find_git", lambda: "/usr/bin/git")
+    monkeypatch.setattr(verification_module, "find_terraform", lambda: "/usr/bin/terraform")
+    monkeypatch.setattr(verification_module, "_run_command", fake_run)
+
+    result = verify_candidate_patch(
+        candidate_patch(), layout, verification_mode="local"
+    )
+
+    assert result.status == "locally_validated"
+    assert result.verification_mode == "local"
+    assert result.plan_requested is False
+    assert result.plan_skip_reason == "cloud_verification_not_configured"
+    assert result.commands.plan.status == "skipped"
+    assert [command[:2] for command in calls] == [
+        ["git", "apply"],
+        ["git", "apply"],
+        ["terraform", "fmt"],
+        ["terraform", "init"],
+        ["terraform", "validate"],
+    ]
+    assert not any(command[:2] == ["terraform", "plan"] for command in calls)
+
+
+@pytest.mark.parametrize("failed_stage", ["fmt", "init", "validate"])
+def test_local_verification_fails_closed_before_plan(
+    monkeypatch, terraform_repo: Path, failed_stage: str
+) -> None:
+    layout = discover_repository(terraform_repo, Path("infrastructure"))
+    calls: list[list[str]] = []
+
+    def fake_run(actual, recorded, **kwargs):
+        calls.append(recorded)
+        if recorded[:2] == ["terraform", failed_stage]:
+            return VerificationCommand(
+                command=recorded, status="failed", exit_code=1
+            )
+        return passed(recorded)
+
+    monkeypatch.setattr(verification_module, "find_git", lambda: "/usr/bin/git")
+    monkeypatch.setattr(verification_module, "find_terraform", lambda: "/usr/bin/terraform")
+    monkeypatch.setattr(verification_module, "_run_command", fake_run)
+
+    result = verify_candidate_patch(
+        candidate_patch(), layout, verification_mode="local"
+    )
+
+    assert result.status == "failed"
+    assert result.failed_stage == failed_stage
+    assert not any(command[:2] == ["terraform", "plan"] for command in calls)
+
+
+def test_local_unsafe_patch_never_runs_commands(monkeypatch, terraform_repo: Path) -> None:
+    monkeypatch.setattr(
+        verification_module,
+        "find_git",
+        lambda: pytest.fail("Git lookup must not run for an unsafe patch"),
+    )
+    layout = discover_repository(terraform_repo, Path("infrastructure"))
+    result = verify_candidate_patch(
+        "--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-a\n+b\n",
+        layout,
+        verification_mode="local",
+    )
+    assert result.status == "rejected"
+    assert result.verification_mode == "local"
+    assert result.commands.patch_check is None
+
+
 def test_outer_markdown_fence_is_classified_as_repairable(
     monkeypatch, terraform_repo: Path
 ) -> None:

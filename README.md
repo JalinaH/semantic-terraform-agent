@@ -4,7 +4,7 @@ Semantic Terraform Agent diagnoses Terraform CI failures, generates a candidate 
 and verifies that patch in an isolated temporary workspace. It supports arbitrary
 Terraform repositories and does not contain benchmark-specific resource logic.
 
-Version: `1.1.6`
+Version: `1.2.0`
 
 ## How it works
 
@@ -16,7 +16,7 @@ Terraform failure and Git diff
   → model selection, immutable diagnosis, and structured semantic edits on a miss
   → deterministic Git unified-diff construction
   → isolated patch application
-  → terraform fmt/init/validate/plan
+  → explicit local (fmt/init/validate) or full (fmt/init/validate/plan) verification
   → at most one repair or schema-context escalation
   → exact verified-patch provenance and mutation eligibility
   → final result JSON
@@ -31,7 +31,7 @@ zero model calls only after it passes fresh isolated verification for the curren
 - Git
 - Terraform on `PATH` for schema inspection and patch verification
 - `OPENROUTER_API_KEY` for the default OpenRouter provider
-- AWS or other provider credentials required by the repository's safe Terraform plan
+- AWS or other provider credentials only for provider-aware full verification
 
 Install locally:
 
@@ -55,6 +55,7 @@ semantic-terraform-agent diagnose \
   --source-revision "$(git -C /path/to/repository rev-parse HEAD)" \
   --context-mode auto \
   --verify-patch \
+  --verification-mode local \
   --max-repair-attempts 1 \
   --output /tmp/result.json
 ```
@@ -84,6 +85,13 @@ commit SHA and must match the checkout's detected `HEAD`. A mismatch fails befor
 model inference. Non-Git repositories continue to work, but their patches are not
 mutation-eligible because a future platform cannot perform an exact head-freshness
 check.
+
+`--verification-mode local` runs patch check, patch application, `terraform fmt
+-check`, backend-disabled `terraform init`, and `terraform validate`, then succeeds as
+`locally_validated` without constructing or running `terraform plan`. It requires no AWS
+credentials. `--verification-mode full` adds the existing safe provider-aware plan and
+is the backward-compatible default. A caller must select local mode intentionally;
+broken credentials in full mode retain their existing environmental classification.
 
 Gemini remains available as an explicit compatibility provider. It requires
 `GEMINI_API_KEY`; neither the CLI nor workflow selects it by default.
@@ -118,9 +126,9 @@ The versioned SHA-256 fingerprint conservatively covers repository scope, failur
 stage, resource identity, exact selected evidence, Terraform source, Terraform/provider
 version evidence, policy versions, and context budgets.
 
-Only patches that previously reached `verified_first_attempt` or
+Only fully verified patches that previously reached `verified_first_attempt` or
 `verified_after_retry` with a complete successful Terraform plan can be stored.
-Environment-blocked results are never stored as verified fixes. A hit means a candidate exists—not that it is
+Locally validated and environment-blocked results are never stored as verified fixes. A hit means a candidate exists—not that it is
 trusted. Every remembered patch is freshly applied and verified in a new temporary copy.
 Stale, corrupt, ambiguous, or unsafe entries fall back to the complete normal pipeline.
 
@@ -141,6 +149,10 @@ patch, isolated verification attempts, actual model usage/cost, separate context
 progression, optimization telemetry, cache status, and `resolution_source`.
 
 ### Verified Patch Artifact
+
+Version 1.2 adds nullable, backward-compatible `verification_mode`, `plan_requested`,
+`plan_attempted`, and `plan_skip_reason` telemetry. Historical documents are not
+inferred as locally validated.
 
 Version 1.1 adds four backward-compatible top-level fields:
 
@@ -164,9 +176,15 @@ source, skipped verification, semantic failure, unknown failure, and incomplete
 verification provenance are ineligible. A remembered patch is evaluated from scratch after fresh verification;
 stored eligibility is never trusted.
 
+A local success has `verification_assessment.outcome = "locally_validated"`, no plan
+failure, `plan_requested = false`, `plan_attempted = false`, `plan_passed = null`, and
+`plan_skip_reason = "cloud_verification_not_configured"`. It is conditionally eligible
+only after the same patch hash, scope, source provenance, clean anchored revision, and
+all five local gates pass. It is never represented as a plan pass.
+
 ### Authoritative Terraform plan outcomes
 
-Version 1.1.4 keeps `terraform plan` as the strongest verification gate. Plan runs with
+Full verification keeps `terraform plan` as the strongest verification gate. Plan runs with
 `-input=false`, `-lock=false`, `-refresh=false`, `-no-color`, and machine-readable JSON
 diagnostics enabled; it never saves or applies a plan. A full patch check, patch apply,
 fmt, init, validate, and plan pass produces `verification_assessment.outcome` =
@@ -275,7 +293,7 @@ The production workflow is:
 ```yaml
 jobs:
   diagnose:
-    uses: JalinaH/semantic-terraform-agent/.github/workflows/terraform-agent.yml@v1.1.6
+    uses: JalinaH/semantic-terraform-agent/.github/workflows/terraform-agent.yml@v1.2.0
     permissions:
       contents: read
       id-token: write

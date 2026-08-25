@@ -18,9 +18,23 @@ def assess_verification(attempt: VerificationAttempt) -> VerificationAssessment:
     plan_attempted = bool(
         commands.plan is not None and commands.plan.status != "skipped"
     )
-    plan = _passed(commands.plan)
+    plan = _passed(commands.plan) if attempt.plan_requested else None
+    local = bool(
+        attempt.verification_mode == "local"
+        and not attempt.plan_requested
+        and not plan_attempted
+        and attempt.plan_skip_reason == "cloud_verification_not_configured"
+        and attempt.status == "locally_validated"
+        and patch_check
+        and patch_apply
+        and fmt
+        and init
+        and validate
+    )
     full = bool(
-        attempt.status == "verified"
+        attempt.verification_mode == "full"
+        and attempt.plan_requested
+        and attempt.status == "verified"
         and patch_check
         and patch_apply
         and fmt
@@ -31,6 +45,8 @@ def assess_verification(attempt: VerificationAttempt) -> VerificationAssessment:
 
     if full:
         outcome = "fully_verified"
+    elif local:
+        outcome = "locally_validated"
     elif attempt.plan_failure is not None:
         if is_environmental_plan_failure(attempt.plan_failure):
             outcome = "environment_blocked"
@@ -52,15 +68,18 @@ def assess_verification(attempt: VerificationAttempt) -> VerificationAssessment:
         outcome = "unknown_failure"
 
     conditionally_eligible = bool(
-        outcome == "environment_blocked"
-        and is_environmental_plan_failure(attempt.plan_failure)
-        and patch_check
-        and patch_apply
-        and fmt
-        and init
-        and validate
-        and plan_attempted
-        and not plan
+        local
+        or (
+            outcome == "environment_blocked"
+            and is_environmental_plan_failure(attempt.plan_failure)
+            and patch_check
+            and patch_apply
+            and fmt
+            and init
+            and validate
+            and plan_attempted
+            and not plan
+        )
     )
     apply_safety = (
         "verified"
@@ -69,6 +88,8 @@ def assess_verification(attempt: VerificationAttempt) -> VerificationAssessment:
     )
     return VerificationAssessment(
         outcome=outcome,
+        verification_mode=attempt.verification_mode,
+        plan_requested=attempt.plan_requested,
         patch_check_passed=patch_check,
         patch_apply_passed=patch_apply,
         fmt_passed=fmt,
@@ -76,6 +97,7 @@ def assess_verification(attempt: VerificationAttempt) -> VerificationAssessment:
         validate_passed=validate,
         plan_attempted=plan_attempted,
         plan_passed=plan,
+        plan_skip_reason=attempt.plan_skip_reason,
         full_verification_passed=full,
         apply_safety=apply_safety,
         plan_failure=attempt.plan_failure,

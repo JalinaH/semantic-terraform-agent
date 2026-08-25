@@ -87,6 +87,7 @@ from semantic_terraform_agent.models import (
     VerificationAttempt,
     VerificationCommands,
     VerificationErrorRelation,
+    VerificationMode,
     VerificationSignal,
 )
 from semantic_terraform_agent.reasoning.base import LLMProvider
@@ -138,6 +139,22 @@ ProviderFactory = Callable[[LLMProviderName, str], LLMProvider]
 
 def _elapsed(start: float) -> float:
     return round(time.perf_counter() - start, 6)
+
+
+def _with_verification_mode(
+    attempt: VerificationAttempt, verification_mode: VerificationMode
+) -> VerificationAttempt:
+    return attempt.model_copy(
+        update={
+            "verification_mode": verification_mode,
+            "plan_requested": verification_mode == "full",
+            "plan_skip_reason": (
+                "cloud_verification_not_configured"
+                if verification_mode == "local"
+                else None
+            ),
+        }
+    )
 
 
 def calculate_evidence_score(
@@ -314,6 +331,12 @@ def _final_status(attempts: list[VerificationAttempt]) -> FinalVerificationStatu
             if len(attempts) == 1
             else "verified_after_retry"
         )
+    if final.status == "locally_validated":
+        return (
+            "locally_validated_first_attempt"
+            if len(attempts) == 1
+            else "locally_validated_after_retry"
+        )
     if final.status == "rejected":
         return "patch_rejected"
     if final.status == "unavailable":
@@ -328,7 +351,12 @@ def _verification_signal(
     attempt: VerificationAttempt,
     reason: str | None = None,
 ) -> VerificationSignal:
-    passed = status in {"verified_first_attempt", "verified_after_retry"}
+    passed = status in {
+        "verified_first_attempt",
+        "verified_after_retry",
+        "locally_validated_first_attempt",
+        "locally_validated_after_retry",
+    }
     if reason is None and not passed and attempt.warnings:
         reason = attempt.warnings[0]
     return VerificationSignal(
@@ -392,6 +420,7 @@ def diagnose_repository(
     model_registry_path: Path | None = None,
     model_registry: ModelRegistry | None = None,
     verification_enabled: bool = True,
+    verification_mode: VerificationMode = "full",
     patch_verifier: PatchVerifier | None = None,
     max_repair_attempts: int = 1,
     failed_stage: FailureStage | None = None,
@@ -405,8 +434,10 @@ def diagnose_repository(
     source_revision: str | None = None,
     cache_store: LocalCacheStore | None = None,
 ) -> ResultDocument:
+    if verification_mode not in {"local", "full"}:
+        raise InputError("verification_mode must be local or full")
     if max_repair_attempts not in (0, 1):
-        raise InputError("max_repair_attempts must be 0 or 1 in version 1.1.6")
+        raise InputError("max_repair_attempts must be 0 or 1 in version 1.2.0")
     selected_provider = parse_provider_name(provider_name)
     total_start = time.perf_counter()
     timing: dict[str, float] = {
@@ -527,7 +558,18 @@ def diagnose_repository(
     lock_fingerprint = provider_lock_fingerprint(layout.terraform_root)
     failure_fingerprint = None
     memory_policy = FailureMemoryPolicy()
-    verifier = patch_verifier or verify_candidate_patch
+    def verifier(
+        patch: str, candidate_layout: RepositoryLayout, *, attempt: int
+    ) -> VerificationAttempt:
+        if patch_verifier is None:
+            return verify_candidate_patch(
+                patch,
+                candidate_layout,
+                attempt=attempt,
+                verification_mode=verification_mode,
+            )
+        result = patch_verifier(patch, candidate_layout, attempt=attempt)
+        return _with_verification_mode(result, verification_mode)
     if failure_memory_enabled and active_cache is not None:
         if memory_policy.eligible_for_lookup(
             diagnosis_context,
@@ -586,6 +628,9 @@ def diagnose_repository(
                         "patch_construction_strategy": "legacy_verified_diff",
                     }
                 )
+                reuse_attempt = _with_verification_mode(
+                    reuse_attempt, verification_mode
+                )
                 timing["initial_verification_seconds"] = _elapsed(
                     verification_started
                 )
@@ -595,10 +640,14 @@ def diagnose_repository(
                 reuse_assessment = assess_verification(reuse_attempt)
                 if reuse_assessment.outcome in {
                     "fully_verified",
+                    "locally_validated",
                     "environment_blocked",
                 }:
                     memory_fully_verified = (
                         reuse_assessment.outcome == "fully_verified"
+                    )
+                    memory_locally_validated = (
+                        reuse_assessment.outcome == "locally_validated"
                     )
                     memory_verification_status = _final_status([reuse_attempt])
                     memory_telemetry = memory_telemetry.model_copy(
@@ -606,10 +655,16 @@ def diagnose_repository(
                             "status": (
                                 "hit_verified"
                                 if memory_fully_verified
-                                else "hit_environment_blocked"
+                                else (
+                                    "hit_locally_validated"
+                                    if memory_locally_validated
+                                    else "hit_environment_blocked"
+                                )
                             ),
                             "reused": True,
-                            "fresh_verification_passed": memory_fully_verified,
+                            "fresh_verification_passed": (
+                                memory_fully_verified or memory_locally_validated
+                            ),
                             "reuse_attempt": reuse_attempt,
                             "llm_calls_avoided": 1,
                             "historical_input_tokens_avoided": memory_entry.historical_input_tokens,
@@ -665,7 +720,7 @@ def diagnose_repository(
                         escalated=False,
                         reason_code=(
                             "verification_passed"
-                            if memory_fully_verified
+                            if memory_fully_verified or memory_locally_validated
                             else "environment_unavailable"
                         ),
                         reason=(
@@ -673,20 +728,24 @@ def diagnose_repository(
                             + (
                                 "passed fresh isolated verification."
                                 if memory_fully_verified
-                                else "passed all pre-plan gates, but fresh plan was environment-blocked."
+                                else (
+                                    "passed fresh isolated local verification."
+                                    if memory_locally_validated
+                                    else "passed all pre-plan gates, but fresh plan was environment-blocked."
+                                )
                             )
                         ),
                         schema_retrieval_attempted=False,
                         schema_retrieved=False,
                         schema_avoided=(
-                            memory_fully_verified
+                            memory_fully_verified or memory_locally_validated
                             if context_mode == "auto"
                             else None
                         ),
                         schema_avoidance_reason=(
                             (
                                 "successful_minimal_verification"
-                                if memory_fully_verified
+                                if memory_fully_verified or memory_locally_validated
                                 else "verification_stopped_before_schema_decision"
                             )
                             if context_mode == "auto"
@@ -742,6 +801,10 @@ def diagnose_repository(
                         source_provenance=source_provenance,
                         verification_provenance=verification_provenance,
                         verification_assessment=verification_assessment,
+                        verification_mode=verification_assessment.verification_mode,
+                        plan_requested=verification_assessment.plan_requested,
+                        plan_attempted=verification_assessment.plan_attempted,
+                        plan_skip_reason=verification_assessment.plan_skip_reason,
                         mutation_eligibility=mutation_eligibility,
                         warnings=warnings,
                     )
@@ -1038,6 +1101,7 @@ def diagnose_repository(
                 "patch_construction_strategy": initial_candidate_patch.construction.strategy,
             }
         )
+    first_attempt = _with_verification_mode(first_attempt, verification_mode)
     timing["initial_verification_seconds"] = _elapsed(started)
     timing["verification_seconds"] = timing["initial_verification_seconds"]
     attempts = [first_attempt]
@@ -1284,6 +1348,9 @@ def diagnose_repository(
                 + timing["second_verification_seconds"],
                 6,
             )
+            second_attempt = _with_verification_mode(
+                second_attempt, verification_mode
+            )
             attempts.append(second_attempt)
 
     assert semantic_call_attempts <= 2, "the agent permits at most two semantic model calls"
@@ -1477,7 +1544,12 @@ def diagnose_repository(
             (not schema_retrieval_attempted)
             if context_mode == "auto"
             and verification_status
-            in {"verified_first_attempt", "verified_after_retry"}
+            in {
+                "verified_first_attempt",
+                "verified_after_retry",
+                "locally_validated_first_attempt",
+                "locally_validated_after_retry",
+            }
             else None
         ),
         schema_avoidance_reason=(
@@ -1492,7 +1564,12 @@ def diagnose_repository(
             )
             if context_mode == "auto"
             and verification_status
-            in {"verified_first_attempt", "verified_after_retry"}
+            in {
+                "verified_first_attempt",
+                "verified_after_retry",
+                "locally_validated_first_attempt",
+                "locally_validated_after_retry",
+            }
             else (
                 (
                     "verification_not_successful"
@@ -1590,6 +1667,10 @@ def diagnose_repository(
         source_provenance=source_provenance,
         verification_provenance=verification_provenance,
         verification_assessment=verification_assessment,
+        verification_mode=verification_assessment.verification_mode,
+        plan_requested=verification_assessment.plan_requested,
+        plan_attempted=verification_assessment.plan_attempted,
+        plan_skip_reason=verification_assessment.plan_skip_reason,
         mutation_eligibility=mutation_eligibility,
         warnings=warnings,
     )

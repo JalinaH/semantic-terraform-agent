@@ -94,6 +94,27 @@ def _verified_attempt(patch: str, attempt: int) -> VerificationAttempt:
     )
 
 
+def _locally_validated_attempt(patch: str, attempt: int) -> VerificationAttempt:
+    passed = _passed()
+    return VerificationAttempt(
+        attempt=attempt,
+        patch=patch,
+        status="locally_validated",
+        changed_files=["infrastructure/main.tf"],
+        commands=VerificationCommands(
+            patch_check=passed,
+            patch_apply=passed,
+            fmt=passed,
+            init=passed,
+            validate=passed,
+        ),
+        temporary_copy_cleaned=True,
+        verification_mode="local",
+        plan_requested=False,
+        plan_skip_reason="cloud_verification_not_configured",
+    )
+
+
 def _failed_plan_attempt(
     patch: str, attempt: int, message: str
 ) -> VerificationAttempt:
@@ -175,6 +196,7 @@ def _run(
     failure_memory_enabled: bool = False,
     max_repair_attempts: int = 1,
     context_mode: str = "lightweight",
+    verification_mode: str = "full",
 ):
     return diagnose_repository(
         repo_path=terraform_repo,
@@ -191,7 +213,53 @@ def _run(
         cache_store=cache_store,
         failure_memory_enabled=failure_memory_enabled,
         repository_id="owner/repository",
+        verification_mode=verification_mode,
     )
+
+
+def test_local_success_is_conditional_and_never_enters_verified_memory(
+    terraform_repo: Path,
+    failure_log: Path,
+    diff_file: Path,
+    tmp_path: Path,
+) -> None:
+    commit = _commit(terraform_repo)
+    provider = PlanProvider()
+    store = LocalCacheStore(tmp_path / "cache")
+    result = _run(
+        terraform_repo,
+        failure_log,
+        diff_file,
+        provider,
+        lambda patch, layout, *, attempt: _locally_validated_attempt(
+            patch, attempt
+        ),
+        source_revision=commit,
+        cache_store=store,
+        failure_memory_enabled=True,
+        verification_mode="local",
+    )
+
+    assessment = result.verification_assessment
+    assert result.diagnosis.verification_status == "locally_validated_first_attempt"
+    assert assessment.outcome == "locally_validated"
+    assert assessment.verification_mode == "local"
+    assert assessment.plan_requested is False
+    assert assessment.plan_attempted is False
+    assert assessment.plan_passed is None
+    assert assessment.plan_skip_reason == "cloud_verification_not_configured"
+    assert assessment.full_verification_passed is False
+    assert assessment.plan_failure is None
+    assert result.mutation_eligibility.eligible is True
+    assert result.mutation_eligibility.eligibility_level == "conditional"
+    assert result.mutation_eligibility.reason_code == (
+        "locally_validated_terraform_patch"
+    )
+    assert result.cache.failure_memory.write_status == "not_attempted"
+    assert store.stats()["failure_memory_entries"] == 0
+    assert provider.diagnose_calls == 1
+    assert provider.repair_calls == 0
+    assert result.llm_usage.call_count == 1
 
 
 def test_full_plan_pass_is_fully_verified_and_normally_eligible(

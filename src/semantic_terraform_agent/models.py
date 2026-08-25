@@ -507,12 +507,16 @@ class VerificationCommand(StrictModel):
 VerificationStage: TypeAlias = Literal[
     "patch_check", "patch_apply", "fmt", "init", "validate", "plan"
 ]
+VerificationMode: TypeAlias = Literal["local", "full"]
+PlanSkipReason: TypeAlias = Literal["cloud_verification_not_configured"]
 AttemptStatus: TypeAlias = Literal[
-    "verified", "failed", "rejected", "unavailable", "skipped"
+    "verified", "locally_validated", "failed", "rejected", "unavailable", "skipped"
 ]
 FinalVerificationStatus: TypeAlias = Literal[
     "verified_first_attempt",
     "verified_after_retry",
+    "locally_validated_first_attempt",
+    "locally_validated_after_retry",
     "verification_failed",
     "patch_rejected",
     "verification_unavailable",
@@ -569,6 +573,7 @@ PlanFailureReasonCode: TypeAlias = Literal[
 
 VerificationOutcome: TypeAlias = Literal[
     "fully_verified",
+    "locally_validated",
     "environment_blocked",
     "semantic_failure",
     "patch_invalid",
@@ -583,6 +588,7 @@ ApplySafety: TypeAlias = Literal[
 
 MutationEligibilityReasonCode: TypeAlias = Literal[
     "verified_terraform_patch",
+    "locally_validated_terraform_patch",
     "terraform_plan_environment_blocked",
     "not_verified",
     "patch_rejected",
@@ -611,13 +617,16 @@ class PlanFailure(StrictModel):
 
 class VerificationAssessment(StrictModel):
     outcome: VerificationOutcome
+    verification_mode: VerificationMode = "full"
+    plan_requested: bool = True
     patch_check_passed: bool
     patch_apply_passed: bool
     fmt_passed: bool
     init_passed: bool
     validate_passed: bool
     plan_attempted: bool
-    plan_passed: bool
+    plan_passed: bool | None
+    plan_skip_reason: PlanSkipReason | None = None
     full_verification_passed: bool
     apply_safety: ApplySafety
     plan_failure: PlanFailure | None = None
@@ -659,6 +668,9 @@ class VerificationAttempt(StrictModel):
     candidate_representation: Literal["structured_edit", "legacy_diff"] | None = None
     patch_construction_strategy: str | None = Field(default=None, max_length=80)
     plan_failure: PlanFailure | None = None
+    verification_mode: VerificationMode = "full"
+    plan_requested: bool = True
+    plan_skip_reason: PlanSkipReason | None = None
 
 
 class SourceProvenance(StrictModel):
@@ -681,9 +693,12 @@ class VerificationProvenance(StrictModel):
     fmt_passed: bool
     init_passed: bool
     validate_passed: bool
+    verification_mode: VerificationMode = "full"
     plan_required: bool = True
+    plan_requested: bool = True
     plan_attempted: bool = False
-    plan_passed: bool
+    plan_passed: bool | None
+    plan_skip_reason: PlanSkipReason | None = None
     terraform_version: str | None = None
     provider_versions: dict[str, str] = Field(default_factory=dict)
 
@@ -886,6 +901,7 @@ CacheStatus: TypeAlias = Literal[
     "miss",
     "hit",
     "hit_verified",
+    "hit_locally_validated",
     "hit_environment_blocked",
     "hit_stale",
     "read_error",
@@ -945,6 +961,10 @@ class ResultDocument(StrictModel):
     source_provenance: SourceProvenance | None = None
     verification_provenance: VerificationProvenance | None = None
     verification_assessment: VerificationAssessment | None = None
+    verification_mode: VerificationMode | None = None
+    plan_requested: bool | None = None
+    plan_attempted: bool | None = None
+    plan_skip_reason: PlanSkipReason | None = None
     mutation_eligibility: MutationEligibility | None = None
     warnings: list[str] = Field(default_factory=list)
     error: str | None = None

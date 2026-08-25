@@ -21,6 +21,7 @@ from semantic_terraform_agent.models import (
     VerificationAttempt,
     VerificationCommand,
     VerificationCommands,
+    VerificationMode,
     VerificationStage,
 )
 from semantic_terraform_agent.terraform.plan_diagnostics import (
@@ -685,9 +686,39 @@ def _environment_unavailable(command: VerificationCommand) -> bool:
 
 
 def verify_candidate_patch(
-    patch: str, layout: RepositoryLayout, *, attempt: int = 1
+    patch: str,
+    layout: RepositoryLayout,
+    *,
+    attempt: int = 1,
+    verification_mode: VerificationMode = "full",
 ) -> VerificationAttempt:
     """Verify one candidate in a fresh filtered temporary repository copy."""
+    result = _verify_candidate_patch(
+        patch,
+        layout,
+        attempt=attempt,
+        verification_mode=verification_mode,
+    )
+    return result.model_copy(
+        update={
+            "verification_mode": verification_mode,
+            "plan_requested": verification_mode == "full",
+            "plan_skip_reason": (
+                "cloud_verification_not_configured"
+                if verification_mode == "local"
+                else None
+            ),
+        }
+    )
+
+
+def _verify_candidate_patch(
+    patch: str,
+    layout: RepositoryLayout,
+    *,
+    attempt: int,
+    verification_mode: VerificationMode,
+) -> VerificationAttempt:
     commands = VerificationCommands()
     try:
         changed_files = validate_patch_scope(patch, layout)
@@ -960,6 +991,33 @@ def verify_candidate_patch(
                     ),
                     reason,
                 ),
+            )
+
+        if verification_mode == "local":
+            reason = (
+                "Terraform plan was not requested because cloud verification "
+                "is not configured."
+            )
+            commands.plan = _skipped(
+                [
+                    "terraform",
+                    "plan",
+                    "-input=false",
+                    "-lock=false",
+                    "-refresh=false",
+                    "-no-color",
+                    "-json",
+                ],
+                reason,
+            )
+            return _attempt_result(
+                attempt=attempt,
+                patch=patch,
+                status="locally_validated",
+                failed_stage=None,
+                changed_files=changed_files,
+                commands=commands,
+                warnings=warnings,
             )
 
         commands.plan = _run_command(

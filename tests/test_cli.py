@@ -59,6 +59,26 @@ def test_cli_defaults_to_one_repair_attempt() -> None:
     assert args.max_model_tier == "premium"
     assert args.model_registry is None
     assert args.source_revision is None
+    assert args.verification_mode == "full"
+
+
+def test_cli_accepts_explicit_local_verification_mode() -> None:
+    args = build_parser().parse_args(
+        [
+            "diagnose",
+            "--repo-path",
+            ".",
+            "--terraform-dir",
+            "infrastructure",
+            "--log-file",
+            "plan.log",
+            "--verification-mode",
+            "local",
+            "--output",
+            "result.json",
+        ]
+    )
+    assert args.verification_mode == "local"
 
 
 def test_cli_accepts_full_source_revision() -> None:

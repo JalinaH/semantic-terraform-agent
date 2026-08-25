@@ -119,7 +119,7 @@ class ContextEscalationPolicy:
         )
         signals = _base_signals(verification, relation)
 
-        if verification.status == "verified":
+        if verification.status in {"verified", "locally_validated"}:
             return _stop(
                 level,
                 "verification_passed",
