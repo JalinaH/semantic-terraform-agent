@@ -6,6 +6,11 @@ Terraform repositories and does not contain benchmark-specific resource logic.
 
 Version: `1.2.0`
 
+## Project repositories
+
+- [Semantic Terraform Agent](https://github.com/JalinaH/semantic-terraform-agent) — this repository
+- [TerraFix dashboard and worker](https://github.com/JalinaH/semantic-terraform-dashboard) — the hosted GitHub integration and user interface
+
 ## How it works
 
 ```text
@@ -33,16 +38,20 @@ zero model calls only after it passes fresh isolated verification for the curren
 - `OPENROUTER_API_KEY` for the default OpenRouter provider
 - AWS or other provider credentials only for provider-aware full verification
 
-Install locally:
+## Setup instructions
+
+Clone and install the project locally:
 
 ```bash
+git clone https://github.com/JalinaH/semantic-terraform-agent.git
+cd semantic-terraform-agent
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -e '.[dev]'
 export OPENROUTER_API_KEY='...'
 ```
 
-## CLI
+## Run instructions
 
 OpenRouter and `openrouter/free` are the fixed-routing defaults:
 
@@ -335,7 +344,9 @@ unchanged, uploads bounded result artifacts, and can publish an idempotent PR co
 Memory is off by default. When enabled, GitHub Actions cache persistence is best-effort
 and repository scoped; it is not a permanent hosted database.
 
-## Development checks
+## How to test
+
+### Automated tests
 
 The full Python test suite remains part of the repository:
 
@@ -348,6 +359,18 @@ git diff --check
 
 Tests use temporary repositories and mocked provider/Terraform boundaries, so the normal
 suite requires no API key, cloud credentials, network, or installed Terraform CLI.
+
+### End-to-end test with the TerraFix dashboard
+
+The complete hosted test procedure is documented in the [TerraFix dashboard README](https://github.com/JalinaH/semantic-terraform-dashboard#how-to-test-the-project-end-to-end). In summary:
+
+1. Download and extract the sample Terraform ZIP supplied with the submission, create a GitHub repository from it, and push its baseline to `main`.
+2. In TerraFix, select **Continue with GitHub**, authorize the repository owner, install the GitHub App for the sample repository, and confirm the repository appears as connected.
+3. Configure Terraform directory `.`, Terraform `1.15.7`, workflow name `Terraform CI`, paths `**/*.tf` and `**/*.tf.json`, failed stage `plan`, pull-request triggers enabled, and a Free OpenRouter model policy. Enable the agent, save, and wait for **TerraFix is ready**.
+4. Create a branch, make a small `.tf` change that introduces the supplied plan failure, commit and push it, then open a pull request into `main`.
+5. Wait for `Terraform CI` to fail. The signed `workflow_run` event automatically triggers TerraFix; verify the run, diagnosis, candidate patch, verification evidence, and PR comment in the dashboard.
+
+OpenRouter's free routing is best effort and can occasionally return no usable or malformed response. In that case, open the failed `Terraform CI` run in GitHub Actions and choose **Re-run jobs** or **Re-run all jobs**. The newly completed failed run triggers a fresh TerraFix attempt.
 
 ## Release
 

@@ -44,6 +44,7 @@ from semantic_terraform_agent.security import redact_secrets
 DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_TIMEOUT_SECONDS = 60.0
 DEFAULT_MAX_RETRIES = 2
+MAX_OPENROUTER_RESPONSE_BYTES = 4 * 1024 * 1024
 _RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 
 
@@ -297,6 +298,11 @@ def _json_fallback_prompt(
 
 
 def _decode_response(response: HTTPResponse) -> dict[str, Any]:
+    if len(response.body) > MAX_OPENROUTER_RESPONSE_BYTES:
+        raise ProviderError(
+            "OpenRouter response exceeded the bounded response size.",
+            category=ProviderFailureCategory.RESPONSE_INVALID,
+        )
     try:
         payload = json.loads(response.body.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):

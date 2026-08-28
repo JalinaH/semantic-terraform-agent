@@ -21,6 +21,7 @@ from semantic_terraform_agent.models import (
 )
 from semantic_terraform_agent.reasoning.openrouter import (
     DEFAULT_OPENROUTER_BASE_URL,
+    MAX_OPENROUTER_RESPONSE_BYTES,
     HTTPResponse,
     OpenRouterProvider,
 )
@@ -280,6 +281,20 @@ def test_invalid_structured_completion_gets_one_bounded_json_retry() -> None:
     assert result.diagnosis.root_cause == "mode is invalid"
     assert len(transport.calls) == 2
     assert "response_format" not in transport.calls[1]["body"]
+
+
+def test_excessive_response_body_gets_only_one_bounded_fallback() -> None:
+    oversized = HTTPResponse(
+            status=200,
+            headers={},
+            body=b"x" * (MAX_OPENROUTER_RESPONSE_BYTES + 1),
+        )
+    transport = FakeTransport(oversized, oversized)
+    with pytest.raises(ProviderError) as exc:
+        provider(transport).diagnose(diagnosis_request())
+    assert exc.value.category is ProviderFailureCategory.RESPONSE_INVALID
+    assert "bounded response size" in str(exc.value)
+    assert len(transport.calls) == 2
 
 
 @pytest.mark.parametrize(

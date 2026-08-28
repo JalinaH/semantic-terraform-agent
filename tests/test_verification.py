@@ -375,6 +375,40 @@ def test_plan_not_executed_when_validate_fails(
     assert not any(command[:2] == ["terraform", "plan"] for command in calls)
 
 
+def test_provider_plugin_failure_during_validate_is_environment_unavailable(
+    monkeypatch, terraform_repo: Path
+) -> None:
+    layout = discover_repository(terraform_repo, Path("infrastructure"))
+    calls: list[list[str]] = []
+
+    def fake_run(actual, recorded, **kwargs):
+        calls.append(recorded)
+        if recorded[:2] == ["terraform", "validate"]:
+            return VerificationCommand(
+                command=recorded,
+                status="failed",
+                exit_code=1,
+                stderr=(
+                    "Failed to load plugin schemas: failed to instantiate provider; "
+                    "Unrecognized remote plugin message"
+                ),
+            )
+        return passed(recorded)
+
+    monkeypatch.setattr(verification_module, "find_git", lambda: "/usr/bin/git")
+    monkeypatch.setattr(verification_module, "find_terraform", lambda: "/usr/bin/terraform")
+    monkeypatch.setattr(verification_module, "_run_command", fake_run)
+
+    result = verify_candidate_patch(candidate_patch(), layout)
+
+    assert result.status == "unavailable"
+    assert result.failed_stage == "validate"
+    assert result.failure_category is PatchFailureCategory.ENVIRONMENT_FAILURE
+    assert result.failure_reason_code == "environment_failure"
+    assert result.commands.plan.status == "skipped"
+    assert not any(command[:2] == ["terraform", "plan"] for command in calls)
+
+
 def test_missing_terraform_is_unavailable_and_does_not_plan(
     monkeypatch, terraform_repo: Path
 ) -> None:
