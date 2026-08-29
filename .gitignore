@@ -17,3 +17,4 @@ semantic-terraform-agent-v1.sqlite3*
 *.tfstate.*
 .env
 src/.DS_Store/
+.DS_Store

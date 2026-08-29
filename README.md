@@ -366,7 +366,7 @@ suite requires no API key, cloud credentials, network, or installed Terraform CL
 
 The project is already deployed at [TerraFix](https://semantic-terraform-dashboard-kappa.vercel.app/), so reviewers do not need to run the dashboard, database, or worker locally. The complete hosted test procedure is documented in the [TerraFix dashboard README](https://github.com/JalinaH/semantic-terraform-dashboard#how-to-test-the-project-end-to-end). In summary:
 
-1. Download and extract the [sample Terraform project ZIP](https://drive.google.com/file/d/REPLACE_WITH_SAMPLE_TERRAFORM_ZIP_FILE_ID/view?usp=sharing), create a GitHub repository from it, and push its baseline to `main`. This placeholder Drive URL must be updated after the final ZIP is uploaded.
+1. Download and extract the [sample Terraform project ZIP](https://drive.google.com/file/d/1J4Xn5zkJNa3b1N8gMuNZH81exiPQNxs-/view?usp=sharing), create a GitHub repository from it, and push its baseline to `main`. This placeholder Drive URL must be updated after the final ZIP is uploaded.
 2. Open the [deployed TerraFix dashboard](https://semantic-terraform-dashboard-kappa.vercel.app/), select **Continue with GitHub**, authorize the repository owner, install the GitHub App for the sample repository, and confirm the repository appears as connected.
 3. Configure Terraform directory `.`, Terraform `1.15.7`, workflow name `Terraform CI`, paths `**/*.tf` and `**/*.tf.json`, failed stage `plan`, pull-request triggers enabled, and a Free OpenRouter model policy. Enable the agent, save, and wait for **TerraFix is ready**.
 4. Create a branch, make a small `.tf` change that introduces the supplied plan failure, commit and push it, then open a pull request into `main`.
